@@ -1,0 +1,10 @@
+.claude
+.vagrant/
+build/
+ca/
+certs/
+**_bpfel.o
+**_bpfel.go
+tmasqued.conf
+.env
+matrix-results/

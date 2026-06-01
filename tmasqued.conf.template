@@ -1,0 +1,17 @@
+# LOG_LEVEL and ENABLE_STATISTIC are hot-reloaded when this file is saved (no restart
+# needed). Every other key is read once at startup and needs a restart to change.
+# (Comments must be on their own line — an inline "KEY=val # note" makes "# note" part
+# of the value.)
+LOG_LEVEL=info
+WAN_INTERFACE=eth0
+BIND_ADDR=0.0.0.0
+LISTEN_PORT=443
+VIRT_CIDR=100.64.0.1/10
+TUNNEL_MTU=1413
+SAN_DNS_LIST=iiiii.info,*.iiiii.info
+SAN_IP_LIST=1.1.1.1,8.8.4.4,8.8.8.8
+# ENABLE_STATISTIC=true turns on the "[STATISTIC]" packet-trace diagnostics, the
+# per-packet observers, and the pprof/expvar endpoint on :6060. Off by default.
+ENABLE_STATISTIC=false
+# LOG_PACKET=true dumps every packet's payload (extremely verbose; debugging only).
+LOG_PACKET=false
