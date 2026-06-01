@@ -21,7 +21,7 @@ const MaxXDPBatchSize = 1024
 const ethHdrSize = 14
 
 // maxFrameSize is the largest L2 frame we'll ever build: Ethernet + 1500-byte MTU.
-const maxFrameSize = ethHdrSize + 1500
+const maxFrameSize = ethHdrSize + 4082
 
 var totalXDPFlushes atomic.Int64
 var totalXDPPackets atomic.Int64

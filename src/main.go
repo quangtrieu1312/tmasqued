@@ -53,6 +53,29 @@ var serverTunIP netip.Addr
 var tunChanDrops atomic.Uint64
 var pktChanDrops atomic.Uint64
 
+// serverInitialPacketSize is the QUIC outer-packet size, derived at startup from
+// the WAN link MTU (NOT hardcoded) so the tunnel adapts to the underlay: a 1500
+// link -> ~1472, the XDP-native virtio cap 3506 -> ~3478. Pinned because PMTUD is
+// disabled. Hardcoding a jumbo value here would fragment/drop on a 1500/1G link.
+var serverInitialPacketSize int = 1452
+
+const (
+	// xdpNativeMaxMTU mirrors scripts/bootstrap/004: virtio_net rejects MTU > 3506
+	// for XDP native mode, so the tunnel can't use an outer packet bigger than this
+	// regardless of what the underlay link advertises.
+	xdpNativeMaxMTU = 3506
+	// outerOverhead sizes the QUIC packet so the resulting IP packet (IPS+IP20+UDP8)
+	// stays SAFELY under the WAN MTU. = 28 (IP+UDP) + 28B path-safety margin: a real
+	// path can carry slightly less than the link MTU (OpenStack VXLAN etc.), and an
+	// IP packet exactly == MTU failed the handshake here (IPS=MTU-28 dropped).
+	outerOverhead = 56
+	// datagramOverhead is the QUIC short header + pktnum + AEAD(16) + connect-ip
+	// ctx/seq above the inner IP packet, so the inner packet fits one DATAGRAM.
+	datagramOverhead = 52
+	// maxQUICPacket == quic-go protocol.MaxPacketBufferSize in our fork (buffer cap).
+	maxQUICPacket = 4000
+)
+
 // tunLoopSends counts download packets pushed into tunChan via the TUN-read
 // loop (XDP_PASS → kernel → TUN fallback, the ipToTunChan/pickTunnel path).
 // If this is nonzero during a download test, a flow is split between this
@@ -60,6 +83,11 @@ var pktChanDrops atomic.Uint64
 var tunLoopSends atomic.Uint64
 
 func main() {
+    // M3 diagnosis (perf branch): enable block + mutex profiling so /debug/pprof/
+    // block and /mutex have data, to pinpoint the serial-pipeline wait (the 2nd
+    // core is ~idle and we need to know exactly what stages block on what).
+    runtime.SetBlockProfileRate(10000)   // ~1 sample per 10us of cumulative blocking
+    runtime.SetMutexProfileFraction(100) // sample 1/100 mutex contention events
     ctx := context.WithoutCancel(context.Background())
     sigc := make(chan os.Signal, 1)
     signal.Notify(sigc,
@@ -106,14 +134,41 @@ func main() {
 		logger.Fatal(fmt.Sprintf("failed to parse FILTER_IP_PROTOCOL: %v", err))
 	}
 
-	mtu, err := strconv.ParseUint(ctx.Value("TUNNEL_MTU").(string), 10, 64)
-	if err != nil {
-        mtu = 1416
-        if logger.ShouldLog(logger.INFO) { logger.Info(fmt.Sprintf("Tunnel MTU is set to default = %d", mtu)) }
-    }
     link, err := netlink.LinkByName(ifaceName)
 	if err != nil {
 		logger.Fatal(fmt.Sprintf("failed to get %s interface: %v", ifaceName, err))
+	}
+	// Adaptive MTU: derive the tunnel inner MTU + the QUIC outer packet size from
+	// the WAN link MTU (capped to the XDP-native virtio limit) instead of hardcoding
+	// a jumbo value. So a 1500/1G underlay -> ~1420 inner / ~1472 outer (old safe
+	// behavior, no fragmentation), a jumbo-capable underlay -> up to ~3426 / ~3478.
+	// An explicit TUNNEL_MTU (>0) overrides the auto value.
+	effWanMTU := link.Attrs().MTU
+	if effWanMTU > xdpNativeMaxMTU {
+		effWanMTU = xdpNativeMaxMTU
+	}
+	serverInitialPacketSize = effWanMTU - outerOverhead // safely under the WAN MTU
+	if serverInitialPacketSize > maxQUICPacket {
+		serverInitialPacketSize = maxQUICPacket
+	}
+	if serverInitialPacketSize < 1252 {
+		serverInitialPacketSize = 1252
+	}
+	var mtu uint64
+	if v, ok := ctx.Value("TUNNEL_MTU").(string); ok {
+		if m, e := strconv.ParseUint(v, 10, 64); e == nil {
+			mtu = m
+		}
+	}
+	if mtu == 0 { // auto: inner fits one DATAGRAM in the outer QUIC packet
+		inner := serverInitialPacketSize - datagramOverhead
+		if inner < 576 {
+			inner = 576
+		}
+		mtu = uint64(inner)
+	}
+	if logger.ShouldLog(logger.INFO) {
+		logger.Info(fmt.Sprintf("MTU: WAN(eff)=%d -> inner=%d, QUIC InitialPacketSize=%d", effWanMTU, mtu, serverInitialPacketSize))
 	}
 	// assuming we are only doing IPv4
 	family := netlink.FAMILY_V4
@@ -466,13 +521,12 @@ func run(ctxt context.Context, upChan chan<- bool, bindTo netip.AddrPort, ipProt
 		return fmt.Errorf("interface %s: %w", ifaceName, err)
 	}
 	localAddr := &net.UDPAddr{IP: bindTo.Addr().AsSlice(), Port: int(bindTo.Port())}
-	// Bind one xsk per real NIC RX queue. We do NOT pin to a single queue via a
-	// runtime `ethtool -L combined N`: on virtio-net that recreates the queue rings
-	// and silently breaks the XDP->xsk RX path (packets hit XDP but never reach the
-	// socket). MaximizeChannels is best-effort and a no-op on virtio (the ethtool
-	// EINVALs while XDP is attached), so we ride whatever the NIC booted with. Our
-	// outer transport is one QUIC 5-tuple per client, so RSS pins each tunnel's flow
-	// to one queue (no cross-tunnel reorder) regardless of how many queues exist.
+	// Auto-detect + maximize NIC combined channels BEFORE binding AF_XDP. This
+	// frees all hardware TX rings the driver can offer, so the datagram TX
+	// path can fan out across them. On a fresh boot the OCI NICs typically
+	// report combined=1 even though the hardware supports more — auto-setting
+	// here makes the perf path symmetric with WireGuard's multi-queue TX.
+	// Failure is non-fatal: we fall back to whatever the soft limit was.
 	finalCombined, err := xdp.MaximizeChannels(ifaceName)
 	if err != nil {
 		if logger.ShouldLog(logger.INFO) {
@@ -538,7 +592,7 @@ func run(ctxt context.Context, upChan chan<- bool, bindTo netip.AddrPort, ipProt
             // is rejected with DatagramTooLargeError (connect-ip swallows it) →
             // 0 download throughput. 1452 = MaxPacketBufferSize → ~1415B budget,
             // which accommodates the 1400 tun MTU (assumes a >=1480-capable WAN).
-            InitialPacketSize: 1452,
+            InitialPacketSize: uint16(serverInitialPacketSize),
             // DatagramSendBuckets is set to the active NIC combined-channel
             // count so per-flow TX dispatch can route each bucket to its own
             // hardware ring (Phase 3 of the multi-worker fan-out). When the
@@ -593,20 +647,21 @@ func run(ctxt context.Context, upChan chan<- bool, bindTo netip.AddrPort, ipProt
                 tunChan := pickTunnel(ipToTunChan[destIP], pkt.Buf[:pkt.N])
                 mu.RUnlock()
 				if tunChan != nil {
-					if trySendTun(tunChan, pkt) {
-						tunLoopSends.Add(1)
-					} else {
-						utility.PacketPool.Put(pkt) // tunChan full or closed (disconnect): drop
-						if logger.ShouldLog(logger.TRACE) {
-							logger.Trace(fmt.Sprintf("queue#%d client %s channel full/closed, dropping packet.", id, destIP.String()))
-						}
-						tunChanDrops.Add(1)
+    				select {
+    					case tunChan <- pkt:
+								tunLoopSends.Add(1)
+    					default:
+            				utility.PacketPool.Put(pkt) // return on error path too
+							if logger.ShouldLog(logger.TRACE) {
+        						logger.Trace(fmt.Sprintf("queue#%d client %s channel full, dropping packet.", id, destIP.String()))
+    						}
+							tunChanDrops.Add(1)
 					}
 				} else {
-					utility.PacketPool.Put(pkt) // no live tunnel for this client: drop
+            		utility.PacketPool.Put(pkt) // return on error path too
 					if logger.ShouldLog(logger.TRACE) {
-						logger.Trace(fmt.Sprintf("queue#%d cannot find connection for client IP = %s. Dropping packet.", id, destIP.String()))
-					}
+                    	logger.Trace(fmt.Sprintf("queue#%d cannot find connection for client IP = %s. Dropping packet.", id, destIP.String()))
+                	}
 				}
         	}
     	}(dev, i)
@@ -675,27 +730,6 @@ func run(ctxt context.Context, upChan chan<- bool, bindTo netip.AddrPort, ipProt
 	<-ctx.Done()
 	upChan <- false
 	return nil
-}
-
-// trySendTun hands pkt to a client's tunChan, returning true iff ownership was
-// transferred (the consumer will pool-Put it). It is non-blocking — a full
-// channel returns false — and recovers from a send on a CLOSED channel, which
-// can race when the destination client's handleConn closes its tunChan on
-// disconnect. Both cases are treated as a drop; the caller pool-Puts and counts
-// it. Dropping is always safe: the tunnel carries inner TCP in unreliable
-// datagrams, so a dropped packet is simply retransmitted by the inner flow.
-func trySendTun(ch chan *utility.Packet, pkt *utility.Packet) (delivered bool) {
-	defer func() {
-		if recover() != nil {
-			delivered = false // ch was closed (peer disconnected) — drop
-		}
-	}()
-	select {
-	case ch <- pkt:
-		return true
-	default:
-		return false
-	}
 }
 
 // pickTunnel selects the bonded tunnel for a download packet by hashing its
@@ -798,19 +832,19 @@ func handleConn(ctx context.Context, tunChan chan *utility.Packet,  conn *connec
 	}
 
 	go func() {
-    	// reader goroutine
+    	// reader goroutine — read connect-ip's decapped inner IP packet DIRECTLY into
+    	// the pooled buffer (no stack-buffer + copy); saves one memmove per upload pkt.
     	go func() {
-        	b := make([]byte, 1500)
         	for {
-            	n, err := conn.ReadPacket(b)
+        		p := utility.PacketPool.Get().(*utility.Packet)
+            	n, err := conn.ReadPacket(p.Buf)
             	if err != nil {
+            		utility.PacketPool.Put(p)
                 	close(pktChan)
                 	errChan <- err
                 	return
             	}
-				p := utility.PacketPool.Get().(*utility.Packet)
         		p.N = n
-        		copy(p.Buf[:n], b[:n])
 				select {
         			case pktChan <- p:
         			default:
@@ -828,46 +862,6 @@ func handleConn(ctx context.Context, tunChan chan *utility.Packet,  conn *connec
     		return
 		}
 		defer batch.Close()
-
-		// route sends one decap'd UPLOAD packet to its destination:
-		//   1. the server itself (dst == wanAddr/serverTunIP) -> local TUN deliver;
-		//   2. another connected VPN client (dst is in ipToTunChan) -> down THAT
-		//      client's own bonded tunnel, flow-pinned, NO SNAT (client-to-client);
-		//   3. otherwise -> SNAT + forward to the WAN/internet.
-		// Case 2 was previously missing: a packet to another client's tunnel IP fell
-		// into the forward branch and got SNAT'd to the internet, where a CGNAT/private
-		// client /32 isn't routable -> VPN peers could not reach each other. The lookup
-		// mirrors the download path (same mu/ipToTunChan/pickTunnel), so it stays
-		// reorder-safe (one inner flow -> one tunnel) and adds only a cheap RLock+map
-		// lookup; non-client destinations fall straight through to the WAN forward.
-		route := func(pkt *utility.Packet) {
-			dst, _ := netip.AddrFromSlice(pkt.Buf[16:20])
-			dst = dst.Unmap()
-			if dst == wanAddr || dst == serverTunIP {
-				tunTapDevice[0].Write(pkt.Buf[:pkt.N])
-				utility.PacketPool.Put(pkt)
-				return
-			}
-			mu.RLock()
-			tc := pickTunnel(ipToTunChan[dst], pkt.Buf[:pkt.N])
-			mu.RUnlock()
-			if tc != nil {
-				if trySendTun(tc, pkt) {
-					return // delivered down the peer's tunnel (consumer pool-Puts it)
-				}
-				// peer's tunChan full or closed (disconnect) — drop; TCP retransmits.
-				utility.PacketPool.Put(pkt)
-				tunChanDrops.Add(1)
-				return
-			}
-			// dst IP (pkt.Buf[16:20]) is the target — unchanged by SNAT, which only
-			// rewrites the source. Resolve its on-link MAC so the frame goes direct
-			// instead of hairpinning through the gateway.
-			xdp.ApplySNAT(pkt.Buf[:pkt.N], wanAddr, natTable)
-			batch.Add(pkt.Buf[:pkt.N], afxdpConn.NextHopMACForIP(pkt.Buf[16:20]))
-			utility.PacketPool.Put(pkt)
-		}
-
     	ticker := time.NewTicker(5 * time.Millisecond)
     	defer ticker.Stop()
     	for {
@@ -881,10 +875,33 @@ func handleConn(ctx context.Context, tunChan chan *utility.Packet,  conn *connec
 				if logPacket {
 					if logger.ShouldLog(logger.INFO) { logger.Info(fmt.Sprintf("TUN -> WAN: read %d bytes, payload = %x", pkt.N, pkt.Buf[:pkt.N])) }
 				}
-				route(pkt)
+				dst, _ := netip.AddrFromSlice(pkt.Buf[16:20])
+				dst = dst.Unmap()
+
+				if dst == wanAddr || dst == serverTunIP {
+    				tunTapDevice[0].Write(pkt.Buf[:pkt.N])
+    				utility.PacketPool.Put(pkt)
+				} else {
+					xdp.ApplySNAT(pkt.Buf[:pkt.N], wanAddr, natTable)
+					batch.Add(pkt.Buf[:pkt.N], afxdpConn.NextHopMACForIP(pkt.Buf[16:20]))
+					utility.PacketPool.Put(pkt)
+				}
 				for len(pktChan) > 0 && !batch.Full() {
                 	pkt = <-pktChan
-					route(pkt)
+					dst, _ := netip.AddrFromSlice(pkt.Buf[16:20])
+					dst = dst.Unmap()
+
+					if dst == wanAddr || dst == serverTunIP {
+    					tunTapDevice[0].Write(pkt.Buf[:pkt.N])
+    					utility.PacketPool.Put(pkt)
+					} else {
+						xdp.ApplySNAT(pkt.Buf[:pkt.N], wanAddr, natTable)
+						// dst IP (pkt.Buf[16:20]) is the target — unchanged by SNAT,
+						// which only rewrites the source. Resolve its on-link MAC so the
+						// frame goes direct instead of hairpinning through the gateway.
+						batch.Add(pkt.Buf[:pkt.N], afxdpConn.NextHopMACForIP(pkt.Buf[16:20]))
+						utility.PacketPool.Put(pkt)
+					}
             	}
             	// Flush once the input channel is drained and the batch has anything,
             	// instead of waiting for the ticker. Under load the inner drain loop
@@ -994,11 +1011,7 @@ func handleConn(ctx context.Context, tunChan chan *utility.Packet,  conn *connec
     {
         key := addr.Unmap()
         chans := ipToTunChan[key]
-        // Only clear our own slot. If a newer connection for the same vIP already
-        // re-registered chans[tunIdx] (reconnect race), this stale teardown must be
-        // a no-op — otherwise it nils the live channel and the delete below wipes the
-        // peer's entry, silently blackholing client-to-client delivery to it.
-        if tunIdx >= 0 && tunIdx < len(chans) && chans[tunIdx] == tunChan {
+        if tunIdx >= 0 && tunIdx < len(chans) {
             chans[tunIdx] = nil
         }
         live := false

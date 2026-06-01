@@ -32,7 +32,7 @@ type SocketBatch struct {
     iovs   []unix.Iovec
     addrs4 []unix.RawSockaddrInet4
     addrs6 []unix.RawSockaddrInet6
-    bufs   [MaxSocketBatchSize][1500]byte
+    bufs   [MaxSocketBatchSize][4096]byte
     count  int
 }
 
