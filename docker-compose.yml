@@ -1,0 +1,26 @@
+services:
+  tmasqued:
+    build: .
+    cap_add:
+      - NET_ADMIN
+      - NET_RAW
+      - SYS_ADMIN
+    privileged: true
+    network_mode: host
+    environment:
+      - GOTRACEBACK=all
+    devices:
+      - /dev/net/tun:/dev/net/tun
+    volumes:
+      - ./certs:/etc/tmasqued/certs
+      - ./ca:/etc/tmasqued/ca
+      - ./tmasqued.conf:/etc/tmasqued/tmasqued.conf
+      - db:/etc/tmasqued/data
+      - /sys/fs/bpf:/sys/fs/bpf
+    ulimits:
+      memlock:
+        soft: -1
+        hard: -1
+    command: /run.sh
+volumes:
+    db:
