@@ -7,4 +7,3 @@ certs/
 **_bpfel.go
 tmasqued.conf
 .env
-matrix-results/

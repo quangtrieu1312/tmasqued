@@ -11,6 +11,6 @@ type Packet struct {
 
 var PacketPool = sync.Pool{
     New: func() any {
-        return &Packet{Buf: make([]byte, 1500)}
+        return &Packet{Buf: make([]byte, 4096)}
     },
 }

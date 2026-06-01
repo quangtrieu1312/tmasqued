@@ -37,8 +37,8 @@ var rxPollTimeoutMs = func() int {
 
 const (
     ethHdr   = 14
-    maxFrameSize = ethHdr + 1500
-    umemFrameSize = 2048 // must match SocketOptions.FrameSize; upper bound on any RX frame
+    maxFrameSize = ethHdr + 4082
+    umemFrameSize = 4096 // must match SocketOptions.FrameSize; upper bound on any RX frame
 )
 
 // rxBufPool recycles the payload buffers handed to quic-go over quicCh,
@@ -143,7 +143,7 @@ func NewConn(
 	for i := 0; i < numQueues; i++ {
 		opts := &xdp.SocketOptions{
     		NumFrames:              4096,  // 2048 TX + 2048 RX
-    		FrameSize:              2048,
+    		FrameSize:              4096,
     		FillRingNumDescs:       2048,
     		CompletionRingNumDescs: 2048,
     		RxRingNumDescs:         2048,
@@ -197,6 +197,12 @@ func NewConn(
 // goroutine that calls Receive/Fill/GetDescs(true) on this socket, so the RX
 // path needs no lock. It reads every frame, inspects the destination port,
 // and routes to the appropriate channel.
+//
+// NOTE: a single-queue RX-worker fan-out (1 ring-drainer + 1 per-frame worker on
+// a 2nd core) was tried here and measured FLAT — the single-queue server ceiling
+// is TX-side (one AF_XDP TX ring + one txMu funnel + single-core softirq), not RX
+// dispatch, so engaging a 2nd core on RX buys nothing. See the perf log. The
+// multi-core de-funnel belongs on the M3 multi-queue NIC, not here.
 func (c *Conn) dispatchSocket(idx int) {
     sock := c.sockets[idx]
     pfds := []unix.PollFd{{Fd: int32(sock.FD()), Events: unix.POLLIN}}
@@ -308,8 +314,6 @@ func (c *Conn) NextHopMACForIP(ip []byte) net.HardwareAddr {
     return c.gwMAC
 }
 
-// dispatchFrame routes a single raw Ethernet frame to quicCh or the fwd handler.
-// Called only from the owning dispatchSocket goroutine, so Fill needs no lock.
 func (c *Conn) dispatchFrame(frame, _ []byte, sock *xdp.Socket, desc xdp.Desc) {
     refill := func() {
         sock.Fill([]xdp.Desc{desc})
