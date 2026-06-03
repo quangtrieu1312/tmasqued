@@ -69,6 +69,43 @@ run two clients concurrently to separate targets. `gw` = gateway CPU%. The 1500-
 WireGuard's order of magnitude and is fairer across concurrent clients; at a 1500 inner MTU the
 kernel datapath leads. Both sit well behind a direct path.
 
+### Single-queue server scaling (8-core, measured 2026-06)
+
+A second testbed (one **8-core** virtio server, single NIC RX queue `Combined=1`, 4 concurrent
+clients → one 4-core iperf3 target, jumbo MTU) isolates the **server aggregate (M3)** ceiling.
+Comparison baseline is **kernel-space WireGuard** (`wireguard.ko` loaded, no userspace
+`wireguard-go`/`boringtun` — verified on every host).
+
+| 4-client aggregate, upload | throughput | server CPU | what's the limit |
+|---|--:|--:|---|
+| **kernel WireGuard**, RPS **off** | ~3.4 G | cpu6 **100%** (1 core), rest idle | single RX-queue softirq |
+| **kernel WireGuard**, RPS **on**  | **~7.3 G** | ~3.4 / 8 cores (spread) | client generation |
+| **tmasque** (AF_XDP, after the TX-pump fix below) | ~3.0 G | ~3.9 / 8 cores, **all cores ~50%** | client generation |
+
+**The original wall, and the fix.** A live mutex profile first showed tmasque pinned at ~3 G while
+the server sat at only ~48% CPU — **contention-bound, not CPU-bound**, with **~90% of lock
+contention on the single AF_XDP TX ring's mutex** (`txMu`: `ForwardBatch.Flush` 56% + QUIC
+`WriteBatch` 32%). An AF_XDP socket binds to one `(netdev, queue)`, so on a single-queue NIC there
+is exactly one TX ring, and every connection's TX serialized on its lock — the userspace mirror of
+a TX path that *can't* spread across cores. The fix mirrors the kernel's **lockless qdisc**: a
+**single-owner TX pump** (`src/xdp/txpump.go`) — one goroutine owns each socket's TX + completion
+rings, and all producers enqueue complete frames lock-free. After it, the funnel is gone: the TX
+ring never backs up (`txFree` stays full, zero TX drops) and **load spreads evenly — all 8 cores
+peak ~50%, no single core pegged**.
+
+**What still limits it (all measured, `pprof` + `/proc`).** With the TX funnel removed, tmasque is
+no longer server-bound at 3 G — the server has ~2× headroom. The remaining limits are:
+- **Client generation.** Each tmasque client is one userspace-QUIC connection and is CPU-bound on
+  per-connection crypto; a single connection is also **inner-TCP-loss-bound at ~3 G** regardless of
+  cores. The 4-client fleet here (one 4-core + three 2-core) tops out near 3 G while the server
+  idles at 50%. Saturating the server needs more/stronger connections (~one server core decrypts
+  per connection, so ~8 connections to fill 8 cores).
+- **The next server-side wall is RX, not TX.** A single NIC queue feeds one AF_XDP RX ring drained
+  by one goroutine (one core). Past ~5–6 G that single-core RX dispatch becomes the funnel. RPS (a
+  kernel-RX feature) fixes this for WireGuard (3.4→7.3 G) but does **nothing** for AF_XDP. Spreading
+  AF_XDP RX needs XDP **CPUMAP** or an outer **kernel-UDP + RPS** transport; a **multiqueue NIC**
+  (`hw:vif_multiqueue_enabled`) removes both the RX and TX single-queue limits outright.
+
 ---
 
 ## Architecture

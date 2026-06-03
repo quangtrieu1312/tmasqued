@@ -855,8 +855,8 @@ func handleConn(ctx context.Context, tunChan chan *utility.Packet,  conn *connec
         	}
     	}()
 	
-		sock, srcMAC, dstMAC, genericMode, txMu := afxdpConn.ForwardSocket()
-		batch, err := utility.NewForwardBatch(sock, srcMAC, dstMAC, genericMode, txMu)
+		pump, srcMAC, dstMAC, _ := afxdpConn.ForwardPump()
+		batch, err := utility.NewForwardBatch(pump, srcMAC, dstMAC)
 		if err != nil {
     		errChan <- fmt.Errorf("failed to create forward batch: %w", err)
     		return
@@ -951,11 +951,11 @@ func handleConn(ctx context.Context, tunChan chan *utility.Packet,  conn *connec
 					continue
 				}
 				if len(icmp) > 0 {
-					sock, srcMAC, _, genericMode, txMu := afxdpConn.ForwardSocket()
+					pump, srcMAC, _, _ := afxdpConn.ForwardPump()
 					// Address the ICMP error to its destination's learned next hop
 					// (icmp[16:20] = dst IP), gwMAC fallback, like the bulk egress path.
 					dstMAC := afxdpConn.NextHopMACForIP(icmp[16:20])
-					if err := utility.ForwardSendOne(sock, srcMAC, dstMAC, genericMode, txMu, icmp); err != nil {
+					if err := utility.ForwardSendOne(pump, srcMAC, dstMAC, icmp); err != nil {
 						if logger.ShouldLog(logger.ERROR) { logger.Error(fmt.Sprintf("failed to send ICMP: %v", err)) }
 					}
 				}

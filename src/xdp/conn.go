@@ -70,7 +70,7 @@ type ForwardHandler func(ipPkt []byte, dstIP net.IP) bool
 // One XSK socket is created per NIC queue.
 type Conn struct {
 	sockets   []*xdp.Socket
-	txMus     []sync.Mutex // one per socket; guards that socket's TX + completion rings
+	txPumps   []*txPump // one per socket; single owner of that socket's TX ring (de-funnels TX)
 	localAddr *net.UDPAddr
 	srcMAC    net.HardwareAddr
 	gwMAC     net.HardwareAddr // next-hop fallback for IPs we haven't learned yet
@@ -176,13 +176,21 @@ func NewConn(
 
 	c := &Conn{
 		sockets:   sockets,
-		txMus:     make([]sync.Mutex, numQueues),
 		localAddr: frameLocalAddr,
 		srcMAC:    iface.HardwareAddr,
 		gwMAC:     gwMAC,
 		done:      make(chan struct{}),
 		mode: mode,
 		quicCh:      make(chan quicFrame, 4096),
+	}
+	// One TX pump per socket: the sole owner of that socket's TX + completion
+	// rings. All TX producers (QUIC WriteTo/WriteBatch + the forward path)
+	// enqueue lock-free instead of contending a shared txMu. This is the
+	// userspace analogue of the kernel's lockless qdisc that lets WireGuard
+	// saturate many cores on a single NIC queue.
+	c.txPumps = make([]*txPump, len(sockets))
+	for i := range sockets {
+		c.txPumps[i] = newTxPump(sockets[i], c.done)
 	}
 	// One dispatch goroutine per NIC queue. Each is the sole owner of its
 	// socket's RX ring, so RX needs no lock and spreads across cores when
@@ -369,6 +377,11 @@ func (c *Conn) DiagSnapshot() string {
 
 	// Min free fill ring slots across all sockets (low = RX starvation risk).
 	minFill, minTxFree := 99999, 99999
+	// xsk KERNEL-level RX drops — the uninstrumented loss source. rxRingFull =
+	// the kernel dropped because the RX ring was full (the single dispatch
+	// goroutine couldn't drain a burst in time); fillEmpty = no fill buffers.
+	// These become inner-TCP retransmits (unreliable datagrams don't recover).
+	var rxDropped, rxRingFull, rxFillEmpty uint64
 	for _, s := range c.sockets {
 		if f := s.NumFreeFillSlots(); f < minFill {
 			minFill = f
@@ -376,14 +389,20 @@ func (c *Conn) DiagSnapshot() string {
 		if f := s.NumFreeTxSlots(); f < minTxFree {
 			minTxFree = f
 		}
+		if st, err := s.Stats(); err == nil {
+			rxDropped += st.KernelStats.Rx_dropped
+			rxRingFull += st.KernelStats.Rx_ring_full
+			rxFillEmpty += st.KernelStats.Rx_fill_ring_empty_descs
+		}
 	}
 
 	return fmt.Sprintf(
-		"quicCh=%d/%d(drops=%d) fwdDrops=%d txDrops=%d fillFree=%d txFree=%d",
+		"quicCh=%d/%d(drops=%d) fwdDrops=%d txDrops=%d fillFree=%d txFree=%d xskRxDrop=%d ringFull=%d fillEmpty=%d",
 		quicLen, quicCap, c.quicChDrops.Load(),
 		c.fwdDrops.Load(),
 		c.txDrops.Load(),
 		minFill, minTxFree,
+		rxDropped, rxRingFull, rxFillEmpty,
 	)
 }
 
@@ -488,37 +507,17 @@ func (c *Conn) WriteTo(p []byte, addr net.Addr) (int, error) {
 
 	// Stable per-connection queue (see txSocketIdx) — NOT round-robin.
 	idx := c.txSocketIdx(dst)
-	sock := c.sockets[idx]
-	txMu := &c.txMus[idx]
-
-	// Reap completed TX descriptors before allocating new ones,
-	// so the UMEM free pool never exhausts.
-	txMu.Lock()
-	if nc := sock.NumCompleted(); nc > 0 {
-		sock.Complete(nc)
-	}
-
-	descs := sock.GetDescs(1, false)
-	txMu.Unlock()
-	if len(descs) == 0 {
-		// TX UMEM exhausted — drop silently. Returning an error here would
-		// cause quic-go to treat the write as fatal and close the connection.
-		// Like UDP ENOBUFS, we drop and let QUIC's retransmit recover.
-		c.txDrops.Add(1)
-		return len(p), nil
-	}
-	frame := sock.GetFrame(descs[0])
 
 	// Per-client next hop: address the frame to the MAC learned from this
 	// client's own inbound traffic (gwMAC fallback until first packet seen).
 	dstMAC := c.NextHopMACForIP(dst.IP)
 
-	total := buildUDPFrame(frame, c.srcMAC, dstMAC, c.localAddr, dst, p)
-	descs[0].Len = uint32(total)
-
-	txMu.Lock()
-	sock.Transmit(descs)
-	txMu.Unlock()
+	// Build the L2 frame on the stack and hand it to this socket's TX pump.
+	// The pump (single ring owner) does Complete/GetDescs/Transmit — no lock
+	// here, so concurrent connections never serialize on a shared txMu.
+	var frame [txPumpFrameCap]byte
+	total := buildUDPFrame(frame[:], c.srcMAC, dstMAC, c.localAddr, dst, p)
+	c.txPumps[idx].Submit(frame[:total])
 	return len(p), nil
 }
 
@@ -632,13 +631,14 @@ func resolveIfaceIP(iface *net.Interface) (net.IP, error) {
     return nil, fmt.Errorf("no IPv4 address found on %s", iface.Name)
 }
 
-// ForwardSocket returns an XDP socket, its Ethernet parameters, and the mutex
-// guarding that socket's TX ring, for constructing a utility.XDPBatch.
-// Queues are selected round-robin — same as WriteTo. The returned mutex is the
-// per-socket TX lock, so forward batches on different sockets don't contend.
-func (c *Conn) ForwardSocket() (*xdp.Socket, net.HardwareAddr, net.HardwareAddr, bool, *sync.Mutex) {
+// ForwardPump returns a TX pump (single owner of a socket's TX ring) and its
+// Ethernet parameters, for constructing a utility.XDPBatch. Queues are selected
+// round-robin. Submitting to the pump is lock-free, so forward consumers no
+// longer serialize on a shared per-socket TX mutex — this was the single largest
+// source of aggregate-throughput contention on a single-queue NIC.
+func (c *Conn) ForwardPump() (*txPump, net.HardwareAddr, net.HardwareAddr, bool) {
     idx := int(c.txIdx.Add(1) % uint64(len(c.sockets)))
-    return c.sockets[idx], c.srcMAC, c.gwMAC, c.mode == XDPModeGeneric, &c.txMus[idx]
+    return c.txPumps[idx], c.srcMAC, c.gwMAC, c.mode == XDPModeGeneric
 }
 
 // WriteBatch sends a batch of QUIC packets in a single XDP TX kick.
@@ -667,36 +667,14 @@ func (c *Conn) WriteBatch(pkts [][]byte, addr net.Addr) error {
 	// packet of one QUIC connection on one TX queue so the inner stream (incl. the
 	// tunneled ACK return path) stays in order; bonded tunnels still spread queues.
 	idx := c.txSocketIdx(dst)
-	sock := c.sockets[idx]
-	txMu := &c.txMus[idx]
+	pump := c.txPumps[idx]
 
-	txMu.Lock()
-	if nc := sock.NumCompleted(); nc > 0 {
-		sock.Complete(nc)
+	// Build each frame and enqueue to the TX pump (single ring owner). FIFO +
+	// single producer per connection preserves this connection's packet order.
+	var frame [txPumpFrameCap]byte
+	for i := 0; i < n; i++ {
+		total := buildUDPFrame(frame[:], c.srcMAC, dstMAC, c.localAddr, dst, pkts[i])
+		pump.Submit(frame[:total])
 	}
-
-	descs := sock.GetDescs(n, false)
-	txMu.Unlock()
-	got := len(descs)
-	if got < n {
-		// Partial or zero allocation — UMEM low. Count drops and proceed with
-		// what we have. Do NOT return an error: quic-go closes the connection
-		// on any non-temporary write error. Like UDP ENOBUFS, drop silently.
-		c.txDrops.Add(uint64(n - got))
-		if got == 0 {
-			return nil
-		}
-	}
-
-	// Fill only as many frames as descriptors we actually got
-	for i := 0; i < got; i++ {
-		frame := sock.GetFrame(descs[i])
-		total := buildUDPFrame(frame, c.srcMAC, dstMAC, c.localAddr, dst, pkts[i])
-		descs[i].Len = uint32(total)
-	}
-
-	txMu.Lock()
-	sock.Transmit(descs)
-	txMu.Unlock()
 	return nil
 }

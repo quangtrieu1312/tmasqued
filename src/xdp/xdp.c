@@ -25,7 +25,6 @@ struct {
     __type(value, __u32);
 } xsks_fwd SEC(".maps");
 
-
 /*
  * Incremental checksum update (RFC 1624) when a 32-bit field changes.
  * Uses bpf_csum_diff so byte-order is handled correctly on LE hosts.

@@ -5,9 +5,7 @@ package utility
 import (
     "net"
     "os"
-    "sync"
 
-    "github.com/slavc/xdp"
     "golang.org/x/sys/unix"
 )
 
@@ -32,17 +30,15 @@ type ForwardBatch struct {
 }
 
 func NewForwardBatch(
-    xdpSock        *xdp.Socket,
+    pump           FrameSubmitter,
     srcMAC, dstMAC net.HardwareAddr,
-    genericMode    bool,
-    mu             *sync.Mutex,
 ) (*ForwardBatch, error) {
     sock, err := NewSocketBatch()
     if err != nil {
         return nil, err
     }
     return &ForwardBatch{
-        xdp:  NewXDPBatch(xdpSock, srcMAC, dstMAC, genericMode, mu),
+        xdp:  NewXDPBatch(pump, srcMAC, dstMAC),
         sock: sock,
     }, nil
 }
@@ -84,14 +80,12 @@ func (b *ForwardBatch) Empty() bool {
 // ForwardSendOne is a single-packet send that applies the same routing rule.
 // Use this for low-frequency one-offs (e.g. ICMP errors from WritePacket).
 func ForwardSendOne(
-    xdpSock     *xdp.Socket,
+    pump        FrameSubmitter,
     srcMAC, dstMAC net.HardwareAddr,
-    genericMode bool,
-    mu          *sync.Mutex,
     pkt         []byte,
 ) error {
     if isXDPEligible(pkt) {
-        return SendOne(xdpSock, srcMAC, dstMAC, genericMode, mu, pkt, false)
+        return SendOne(pump, srcMAC, dstMAC, pkt, false)
     }
     return SendOnSocket(pkt, false)
 }
