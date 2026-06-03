@@ -53,6 +53,11 @@ var serverTunIP netip.Addr
 var tunChanDrops atomic.Uint64
 var pktChanDrops atomic.Uint64
 
+// fwdAddDrops counts forward packets the batch refused to enqueue (the
+// ForwardBatch.Add return value was previously ignored → silent drop). Served
+// at /debug/vars as fwd_add_drops.
+var fwdAddDrops = expvar.NewInt("fwd_add_drops")
+
 // serverInitialPacketSize is the QUIC outer-packet size, derived at startup from
 // the WAN link MTU (NOT hardcoded) so the tunnel adapts to the underlay: a 1500
 // link -> ~1472, the XDP-native virtio cap 3506 -> ~3478. Pinned because PMTUD is
@@ -883,7 +888,7 @@ func handleConn(ctx context.Context, tunChan chan *utility.Packet,  conn *connec
     				utility.PacketPool.Put(pkt)
 				} else {
 					xdp.ApplySNAT(pkt.Buf[:pkt.N], wanAddr, natTable)
-					batch.Add(pkt.Buf[:pkt.N], afxdpConn.NextHopMACForIP(pkt.Buf[16:20]))
+					if err := batch.Add(pkt.Buf[:pkt.N], afxdpConn.NextHopMACForIP(pkt.Buf[16:20])); err != nil { fwdAddDrops.Add(1) }
 					utility.PacketPool.Put(pkt)
 				}
 				for len(pktChan) > 0 && !batch.Full() {
@@ -899,7 +904,7 @@ func handleConn(ctx context.Context, tunChan chan *utility.Packet,  conn *connec
 						// dst IP (pkt.Buf[16:20]) is the target — unchanged by SNAT,
 						// which only rewrites the source. Resolve its on-link MAC so the
 						// frame goes direct instead of hairpinning through the gateway.
-						batch.Add(pkt.Buf[:pkt.N], afxdpConn.NextHopMACForIP(pkt.Buf[16:20]))
+						if err := batch.Add(pkt.Buf[:pkt.N], afxdpConn.NextHopMACForIP(pkt.Buf[16:20])); err != nil { fwdAddDrops.Add(1) }
 						utility.PacketPool.Put(pkt)
 					}
             	}
