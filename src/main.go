@@ -49,6 +49,12 @@ var mu *sync.RWMutex
 // while different flows spread across tunnels/cores.
 var ipToTunChan map[netip.Addr][]chan *utility.Packet
 var afxdpConn *xdp.Conn
+// xdpLoaderRef lets GracefullyShutDown detach the XDP bpf_link before restoring
+// the WAN MTU (virtio_net rejects MTU > 3506 while XDP-native is attached).
+var xdpLoaderRef *xdp.Loader
+// wanIfaceName is captured at startup (the signal-handler goroutine's ctx is the
+// pre-config.Load one, so it can't read WAN_INTERFACE from ctx).
+var wanIfaceName string
 var serverTunIP netip.Addr
 var tunChanDrops atomic.Uint64
 var pktChanDrops atomic.Uint64
@@ -57,6 +63,12 @@ var pktChanDrops atomic.Uint64
 // ForwardBatch.Add return value was previously ignored → silent drop). Served
 // at /debug/vars as fwd_add_drops.
 var fwdAddDrops = expvar.NewInt("fwd_add_drops")
+
+// snatFailDrops counts forward packets dropped because SNAT failed (the
+// ApplySNAT return was previously ignored → packet forwarded UN-SNAT'd → target
+// replies to the unroutable client vIP → no ACK → silent inner-TCP loss). Now we
+// drop+count instead. Served at /debug/vars as snat_fail_drops.
+var snatFailDrops = expvar.NewInt("snat_fail_drops")
 
 // serverInitialPacketSize is the QUIC outer-packet size, derived at startup from
 // the WAN link MTU (NOT hardcoded) so the tunnel adapts to the underlay: a 1500
@@ -76,7 +88,8 @@ const (
 	outerOverhead = 56
 	// datagramOverhead is the QUIC short header + pktnum + AEAD(16) + connect-ip
 	// ctx/seq above the inner IP packet, so the inner packet fits one DATAGRAM.
-	datagramOverhead = 52
+	// MEASURED on the wire: outer UDP payload = inner+28. Was 52 (over-reserved 24B).
+	datagramOverhead = 28
 	// maxQUICPacket == quic-go protocol.MaxPacketBufferSize in our fork (buffer cap).
 	maxQUICPacket = 4000
 )
@@ -410,6 +423,39 @@ func RunPreDown() {
 func GracefullyShutDown(ctx context.Context) {
     if logger.ShouldLog(logger.INFO) { logger.Info("Shutting down") }
     db.CloseConnection()
+    // Detach the XDP bpf_link first (virtio_net rejects MTU > 3506 while XDP-native
+    // is attached), then restore the WAN MTU that bootstrap/004 scaled down.
+    if xdpLoaderRef != nil {
+        xdpLoaderRef.Close()
+    }
+    restoreWanMTU(ctx)
+    os.Exit(0)
+}
+
+// restoreWanMTU reverts the WAN interface to the original MTU saved by
+// bootstrap/004 (in /etc/tmasqued/<iface>.wan_mtu.orig) before it scaled the link
+// down to the XDP-native virtio limit. No-op if nothing was scaled (file absent).
+func restoreWanMTU(ctx context.Context) {
+    iface := wanIfaceName
+    if iface == "" {
+        return
+    }
+    origFile := "/etc/tmasqued/" + iface + ".wan_mtu.orig"
+    data, err := os.ReadFile(origFile)
+    if err != nil {
+        return // nothing was scaled, or already restored
+    }
+    mtu, err := strconv.Atoi(strings.TrimSpace(string(data)))
+    if err != nil || mtu <= 0 {
+        return
+    }
+    if link, e := netlink.LinkByName(iface); e == nil {
+        e2 := netlink.LinkSetMTU(link, mtu)
+        if logger.ShouldLog(logger.INFO) {
+            logger.Info(fmt.Sprintf("Restored WAN %s MTU to %d (err=%v)", iface, mtu, e2))
+        }
+    }
+    os.Remove(origFile)
 }
 
 func createTunTapDevice(ctx context.Context, virtIp string, virtPrefixLen int, mtu int) ([]*water.Interface, error) {
@@ -493,6 +539,8 @@ func run(ctxt context.Context, upChan chan<- bool, bindTo netip.AddrPort, ipProt
 	if err != nil {
 		return fmt.Errorf("loading XDP program: %w", err)
 	}
+	xdpLoaderRef = xdpLoader // for GracefullyShutDown's WAN-MTU restore
+	wanIfaceName = ifaceName // captured here; the shutdown goroutine's ctx is pre-config
 	defer xdpLoader.Close()
 	if logger.ShouldLog(logger.INFO) { logger.Info(fmt.Sprintf("XDP mode: %s", xdpLoader.Mode())) }
 	natTable, err := xdp.OpenNatTable()
@@ -887,8 +935,11 @@ func handleConn(ctx context.Context, tunChan chan *utility.Packet,  conn *connec
     				tunTapDevice[0].Write(pkt.Buf[:pkt.N])
     				utility.PacketPool.Put(pkt)
 				} else {
-					xdp.ApplySNAT(pkt.Buf[:pkt.N], wanAddr, natTable)
-					if err := batch.Add(pkt.Buf[:pkt.N], afxdpConn.NextHopMACForIP(pkt.Buf[16:20])); err != nil { fwdAddDrops.Add(1) }
+					if err := xdp.ApplySNAT(pkt.Buf[:pkt.N], wanAddr, natTable); err != nil {
+						snatFailDrops.Add(1) // drop, don't forward un-SNAT'd (→ unroutable reply → silent loss)
+					} else if err := batch.Add(pkt.Buf[:pkt.N], afxdpConn.NextHopMACForIP(pkt.Buf[16:20])); err != nil {
+						fwdAddDrops.Add(1)
+					}
 					utility.PacketPool.Put(pkt)
 				}
 				for len(pktChan) > 0 && !batch.Full() {
@@ -900,11 +951,14 @@ func handleConn(ctx context.Context, tunChan chan *utility.Packet,  conn *connec
     					tunTapDevice[0].Write(pkt.Buf[:pkt.N])
     					utility.PacketPool.Put(pkt)
 					} else {
-						xdp.ApplySNAT(pkt.Buf[:pkt.N], wanAddr, natTable)
 						// dst IP (pkt.Buf[16:20]) is the target — unchanged by SNAT,
 						// which only rewrites the source. Resolve its on-link MAC so the
 						// frame goes direct instead of hairpinning through the gateway.
-						if err := batch.Add(pkt.Buf[:pkt.N], afxdpConn.NextHopMACForIP(pkt.Buf[16:20])); err != nil { fwdAddDrops.Add(1) }
+						if err := xdp.ApplySNAT(pkt.Buf[:pkt.N], wanAddr, natTable); err != nil {
+							snatFailDrops.Add(1) // drop, don't forward un-SNAT'd
+						} else if err := batch.Add(pkt.Buf[:pkt.N], afxdpConn.NextHopMACForIP(pkt.Buf[16:20])); err != nil {
+							fwdAddDrops.Add(1)
+						}
 						utility.PacketPool.Put(pkt)
 					}
             	}
