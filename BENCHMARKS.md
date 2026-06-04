@@ -1,9 +1,11 @@
 # Benchmarks — direct vs WireGuard vs tmasque
 
 Two testbeds:
-1. **Multi-queue / RSS (8-core gateway, 6 clients)** — the current headline: server aggregate (M3)
-   with the NIC's multi-queue RSS enabled, and the **no-RPS / RPS / RSS** progression that explains it.
-2. **2-vCPU gateway (single RX queue, 1–2 clients)** — the earlier per-client (M4) study, kept below.
+1. **Multi-queue / RSS (8-core gateway, 6 clients)** — the main result: the **total throughput a single
+   gateway forwards across many concurrent clients**, with the NIC's multi-queue RSS enabled, and the
+   **no-RPS / RPS / RSS** progression that explains it.
+2. **2-vCPU gateway (single RX queue, 1–2 clients)** — an earlier **per-connection** study (what one or
+   two clients get through a small/cheap gateway), kept below.
 
 ## How to read this
 
@@ -60,7 +62,7 @@ iperf3 -c <target> -p <port> -u -b 1G -P 2
 - **iperf3 direction:** `iperf3 -c` sends **upload** (client → server) **by default**; adding **`-R`** reverses it to **download** (server → client). So an *upload* row = clients pushing to the target; a *download* row = the target pushing to the clients.
 - **Scenarios:** `all upload`/`all download` = all 6 clients in one direction at once; `half (3 up + 3 down)` = 3 clients upload + 3 download concurrently; `1 upload`/`1 download` = a single client.
 - `agg` = sum of the participating clients' receiver Gbit/s. Gateway CPU sampled with `mpstat -P ALL` over the run.
-- **Don't use `-b 0` for UDP** — an unmetered flood overruns the datagram queue and *craters the QUIC
+- **Don't use `-b 0` for UDP** — an unmetered flood overruns the datagram queue and *collapses the QUIC
   tunnel* (the connection drops; clients with a low reconnect budget then exit). We cap at `-b 1G ×2`.
 
 ### What "p2p" means
@@ -239,7 +241,7 @@ The headline above is the **RSS** row. The other two regimes (measured on a sing
 
 ---
 
-# 2. Earlier testbed — 2-vCPU gateway, single RX queue (per-client / M4)
+# 2. Earlier testbed — 2-vCPU gateway, single RX queue (per-connection)
 
 5 VMs (AMD EPYC-Rome, **2 vCPU each**, kernel 6.12, 9000 B links, single NIC RX queue). One is the VPN
 gateway (tmasqued container *or* WireGuard server); two are clients; two are `iperf3` targets reached

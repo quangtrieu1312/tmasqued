@@ -67,7 +67,7 @@ in full (with the **no-RPS / RPS / RSS** progression, exact `iperf3` commands, a
   balanced and leads on aggregate (see BENCHMARKS.md); the edge is specific to the jumbo regime.
 - **WireGuard is faster on a 1-client upload** (3.35 vs 2.05) and **direct is ~6–10×** either VPN —
   both are gateway-CPU-bound on 2 vCPU behind a **single NIC RX queue** (the real ceiling). A
-  separate *single-flow* download collapse (war story below) was a sparse-ACK pacing issue, fixed
+  separate *single-flow* download collapse (postmortem below) was a sparse-ACK pacing issue, fixed
   by routing the small ACKs through the kernel.
 
 **Takeaway:** at its jumbo design point this userspace QUIC/MASQUE tunnel matches kernel
@@ -76,8 +76,8 @@ kernel datapath leads. Both sit well behind a direct path.
 
 ### Server scaling — the single-RX-queue funnel, and why tmasque needs RSS not RPS
 
-On an **8-core** virtio gateway the **server aggregate (M3)** ceiling is set by how the NIC's
-**RX queues** map to cores. Three regimes, measured (baseline = kernel WireGuard, `wireguard.ko`,
+On an **8-core** virtio gateway the **aggregate-throughput** ceiling (total across all clients) is set
+by how the NIC's **RX queues** map to cores. Three regimes, measured (baseline = kernel WireGuard, `wireguard.ko`,
 no userspace impl; concurrent clients → separate iperf3 targets, jumbo inner MTU). Full per-scenario
 numbers and CPU in [BENCHMARKS.md](BENCHMARKS.md).
 
@@ -180,7 +180,7 @@ advertises those as CONNECT-IP routes. You manage clients, roles, and resources 
 | **MTU / datagram budget** | `InitialPacketSize` pinned so the datagram payload budget fits the tunnel MTU — a misconfigured budget silently swallowed `DatagramTooLargeError` and produced **0** download until fixed. |
 | **Inner-TCP buffer tuning** | The tunnel's added RTT enlarges the inner BDP; `tcp_wmem`/`tcp_rmem` are raised at bootstrap so a single inner stream isn't `sndbuf`-limited. |
 
-### The single-stream-download fix (war story)
+### The single-stream-download fix (postmortem)
 
 A single-stream **download** collapsed to ~5–10% of WireGuard — no loss, no ECN, no reorder, an
 open window, and *lower* RTT than WG, so every "where's the throttle?" probe came up empty. We sent
