@@ -39,12 +39,17 @@ engineering* below; how it measures up is in *Performance*.
 
 ## Performance
 
-Head-to-head against a **no-VPN direct baseline** and **kernel WireGuard** on a 5-VM EPYC-Rome
-(2 vCPU) testbed. Each cell is `iperf3 -P8 -t10 -O2` (**8 streams from one client**); 2-client cases
-run two clients concurrently to separate targets. `gw` = gateway CPU%. The 1500-MTU table,
-**client-to-client**, UDP, and full caveats: **[BENCHMARKS.md](BENCHMARKS.md)**.
+Head-to-head against a **no-VPN direct baseline** and **kernel WireGuard**. The per-client table below
+is the 5-VM EPYC-Rome (2 vCPU) testbed; the **8-core / multi-queue (RSS) 6-client server-aggregate**
+results — where tmasque reaches **~8 G alongside WireGuard at jumbo** — are in *Server scaling* below and
+in full (with the **no-RPS / RPS / RSS** progression, exact `iperf3` commands, and p2p setup) in
+**[BENCHMARKS.md](BENCHMARKS.md)**. Each cell is `iperf3 -P8 -t10 -O2` (**8 streams from one client**);
+2-client cases run two clients concurrently to separate targets. `gw` = gateway CPU%.
 
-### TCP at a jumbo inner MTU (Gbit/s, with gateway CPU%)
+### Small server — 5× 2-vCPU VMs, single RX queue (Gbit/s, with gateway CPU%)
+
+> Kept as the **small-VPN-server reference**: a 2-vCPU gateway behind a single NIC RX queue, the
+> realistic shape for a cheap/low-core VPS. (The 8-core multi-queue numbers are in *Server scaling*.)
 
 | case (8 streams) | direct | WireGuard | tmasque |
 |---|--:|--:|--:|
@@ -69,42 +74,58 @@ run two clients concurrently to separate targets. `gw` = gateway CPU%. The 1500-
 WireGuard's order of magnitude and is fairer across concurrent clients; at a 1500 inner MTU the
 kernel datapath leads. Both sit well behind a direct path.
 
-### Single-queue server scaling (8-core, measured 2026-06)
+### Server scaling — the single-RX-queue funnel, and why tmasque needs RSS not RPS
 
-A second testbed (one **8-core** virtio server, single NIC RX queue `Combined=1`, 4 concurrent
-clients → one 4-core iperf3 target, jumbo MTU) isolates the **server aggregate (M3)** ceiling.
-Comparison baseline is **kernel-space WireGuard** (`wireguard.ko` loaded, no userspace
-`wireguard-go`/`boringtun` — verified on every host).
+On an **8-core** virtio gateway the **server aggregate (M3)** ceiling is set by how the NIC's
+**RX queues** map to cores. Three regimes, measured (baseline = kernel WireGuard, `wireguard.ko`,
+no userspace impl; concurrent clients → separate iperf3 targets, jumbo inner MTU). Full per-scenario
+numbers and CPU in [BENCHMARKS.md](BENCHMARKS.md).
 
-| 4-client aggregate, upload | throughput | server CPU | what's the limit |
+| gateway aggregate, upload | WireGuard | tmasque | gateway CPU (of 8 cores) |
 |---|--:|--:|---|
-| **kernel WireGuard**, RPS **off** | ~3.4 G | cpu6 **100%** (1 core), rest idle | single RX-queue softirq |
-| **kernel WireGuard**, RPS **on**  | **~7.3 G** | ~3.4 / 8 cores (spread) | client generation |
-| **tmasque** (AF_XDP, after the TX-pump fix below) | ~3.0 G | ~3.9 / 8 cores, **all cores ~50%** | client generation |
+| **single RX queue** (`Combined=1`), **no** RPS — 4 clients | ~3.4 G | ~3.4 G | **one core pegged 100%**, other 7 idle |
+| **single RX queue** + **RPS on** — 4 clients | **~7.3 G** | ~3.0 G *(unchanged)* | WG spreads to ~3.4/8; tmasque can't move |
+| **multi-queue NIC** (`Combined=8`, **RSS**) — 6 clients | **~9.7 G** | **~8.1 G** | both ~5–6/8, no core pegged |
 
-**The original wall, and the fix.** A live mutex profile first showed tmasque pinned at ~3 G while
-the server sat at only ~48% CPU — **contention-bound, not CPU-bound**, with **~90% of lock
-contention on the single AF_XDP TX ring's mutex** (`txMu`: `ForwardBatch.Flush` 56% + QUIC
-`WriteBatch` 32%). An AF_XDP socket binds to one `(netdev, queue)`, so on a single-queue NIC there
-is exactly one TX ring, and every connection's TX serialized on its lock — the userspace mirror of
-a TX path that *can't* spread across cores. The fix mirrors the kernel's **lockless qdisc**: a
-**single-owner TX pump** (`src/xdp/txpump.go`) — one goroutine owns each socket's TX + completion
-rings, and all producers enqueue complete frames lock-free. After it, the funnel is gone: the TX
-ring never backs up (`txFree` stays full, zero TX drops) and **load spreads evenly — all 8 cores
-peak ~50%, no single core pegged**.
+(First two rows: 4 clients — one 4-core + three 2-core — to a single-queue 8-core gateway. RSS row:
+6 clients — one 4-core + five 2-core — to a multi-queue 8-core gateway, separate non-VPN target. The
+absolute step also reflects the larger fleet; the *shape* — who un-funnels under RPS vs RSS — is the
+point.)
 
-**What still limits it (all measured, `pprof` + `/proc`).** With the TX funnel removed, tmasque is
-no longer server-bound at 3 G — the server has ~2× headroom. The remaining limits are:
-- **Client generation.** Each tmasque client is one userspace-QUIC connection and is CPU-bound on
-  per-connection crypto; a single connection is also **inner-TCP-loss-bound at ~3 G** regardless of
-  cores. The 4-client fleet here (one 4-core + three 2-core) tops out near 3 G while the server
-  idles at 50%. Saturating the server needs more/stronger connections (~one server core decrypts
-  per connection, so ~8 connections to fill 8 cores).
-- **The next server-side wall is RX, not TX.** A single NIC queue feeds one AF_XDP RX ring drained
-  by one goroutine (one core). Past ~5–6 G that single-core RX dispatch becomes the funnel. RPS (a
-  kernel-RX feature) fixes this for WireGuard (3.4→7.3 G) but does **nothing** for AF_XDP. Spreading
-  AF_XDP RX needs XDP **CPUMAP** or an outer **kernel-UDP + RPS** transport; a **multiqueue NIC**
-  (`hw:vif_multiqueue_enabled`) removes both the RX and TX single-queue limits outright.
+> **Note — tmasque's "jumbo" is 3506, not 9000.** `virtio_net` refuses an XDP-native attach above a
+> **3506** B link MTU, so on the 9000 jumbo underlay tmasque's *outer* packet is capped at 3506
+> (inner tun 3422), whereas kernel WireGuard runs the full **8920**. tmasque reaches ~8 G alongside WG
+> *while carrying a ~2.5× smaller packet* — see [BENCHMARKS.md](BENCHMARKS.md) for the implication.
+
+**The funnel.** With one RX queue, every inbound frame lands on **one core's softirq**, and that one
+core caps the whole 8-core box at ~3.4 G whether it's WireGuard's kernel decrypt or tmasque's single
+AF_XDP RX ring drained by one goroutine. Adding clients does nothing — the second core never lights up.
+
+**RPS rescues WireGuard but not tmasque.** RPS re-hashes the kernel's RX softirq across cores, so
+WireGuard jumps **3.4 → 7.3 G**. tmasque's AF_XDP datapath **bypasses the kernel softirq RPS works
+on**, so RPS is inert for it (~3.0 G, unchanged). This is the key asymmetry: *the kernel datapath has
+a kernel knob; the bypass datapath needs the hardware to do the spreading.*
+
+**RSS removes the funnel for both.** A multi-queue NIC (`hw:vif_multiqueue_enabled` → `Combined=8`)
+gives 8 hardware RX queues, each IRQ-pinned to its own core. WireGuard's softirq spreads natively
+(no RPS needed) and tmasque binds **one AF_XDP `xsk` per RX queue** (`src/xdp/conn.go` already loops
+the queue count; the eBPF redirects by `ctx->rx_queue_index`) — so distinct client flows hash to
+distinct queues→cores. Result: **WG ~9.7 G, tmasque ~8.1 G**, both with ~2–3 cores of headroom. At
+the jumbo inner MTU tmasque now sits right alongside kernel WireGuard on the forward path; at a 1500
+inner MTU WireGuard still leads (see BENCHMARKS.md).
+
+**The earlier TX-side wall, and its fix.** Before RX was the limit, a live mutex profile showed
+tmasque pinned at ~3 G with the server only ~48% busy — **contention-bound**, ~90% of it on the single
+AF_XDP TX ring's mutex (`txMu`: `ForwardBatch.Flush` 56% + QUIC `WriteBatch` 32%). The fix mirrors the
+kernel's **lockless qdisc**: a **single-owner TX pump** (`src/xdp/txpump.go`) — one goroutine owns each
+socket's TX + completion rings, all producers enqueue lock-free. After it the TX ring never backs up
+(`txFree` full, zero TX drops) and load spreads evenly across cores.
+
+**What still limits tmasque at jumbo (measured, `pprof` + `/proc`).** Not the gateway (it idles ~2–3
+cores) and not the underlay (direct is 50–60 G). Each tmasque client is one userspace-QUIC connection,
+CPU-bound on per-connection crypto and **inner-TCP-loss-bound at ~2 G** per flow; aggregate is bounded
+by the client fleet and the single target's RX, not the gateway. Saturating the 8-core gateway would
+take more/stronger distinct client flows than this testbed has.
 
 ---
 
