@@ -15,3 +15,9 @@ SAN_IP_LIST=1.1.1.1,8.8.4.4,8.8.8.8
 ENABLE_STATISTIC=false
 # LOG_PACKET=true dumps every packet's payload (extremely verbose; debugging only).
 LOG_PACKET=false
+# Upload-forward egress (both default false = AF_XDP-TX kernel-bypass). Mutually exclusive.
+# FORWARD_TUN_GSO=true coalesces upload TCP into TSO super-frames written to the main tun
+#   (opened IFF_VNET_HDR) so the kernel host-TSO-segments + ip_forwards them.
+# FORWARD_TUN_VHOST=true forwards via a vhost-net-fronted TAP (kernel GRO) instead.
+FORWARD_TUN_GSO=false
+FORWARD_TUN_VHOST=false

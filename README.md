@@ -6,7 +6,8 @@ connections from clients, assigns each a `/32` and a set of routes, and forwards
 traffic to the WAN — over a **kernel-bypass AF_XDP datapath**, **benchmarked head-to-head
 against kernel WireGuard and a no-VPN direct baseline on a multi-Gbit/s testbed**
 (single- and multi-client, both directions, at 1500 and jumbo MTU; see *Performance* for the
-headline and [BENCHMARKS.md](BENCHMARKS.md) for the full matrix and honest scope).
+headline, [BENCHMARKS.md](BENCHMARKS.md) for the max-throughput summary, and
+[FULL_MATRIX.md](FULL_MATRIX.md) for the full per-regime grid and honest scope).
 
 > Client counterpart: [`tmasque`](https://github.com/quangtrieu1312/tmasque).
 > Umbrella repo (setup, certs, management): [`masque-vpn`](https://github.com/quangtrieu1312/masque-vpn).
@@ -79,40 +80,40 @@ kernel datapath leads. Both sit well behind a direct path.
 On an **8-core** virtio gateway the **aggregate-throughput** ceiling (total across all clients) is set
 by how the NIC's **RX queues** map to cores. Three regimes, measured (baseline = kernel WireGuard, `wireguard.ko`,
 no userspace impl; concurrent clients → separate iperf3 targets, jumbo inner MTU). Full per-scenario
-numbers and CPU in [BENCHMARKS.md](BENCHMARKS.md).
+numbers and CPU in [FULL_MATRIX.md](FULL_MATRIX.md).
 
-| gateway aggregate, upload | WireGuard | tmasque | gateway CPU (of 8 cores) |
+| gateway aggregate (6 clients, upload) | WireGuard | tmasque | gateway CPU (of 8 cores) |
 |---|--:|--:|---|
-| **single RX queue** (`Combined=1`), **no** RPS — 4 clients | ~3.4 G | ~3.4 G | **one core pegged 100%**, other 7 idle |
-| **single RX queue** + **RPS on** — 4 clients | **~7.3 G** | ~3.0 G *(unchanged)* | WG spreads to ~3.4/8; tmasque can't move |
-| **multi-queue NIC** (`Combined=8`, **RSS**) — 6 clients | **~9.7 G** | **~8.1 G** | both ~5–6/8, no core pegged |
+| **single RX queue** (`Combined=1`), **no** RPS | ~4.4 G | ~2.8 G | ~3–4/8 cores, **none pegged** — single-queue serialization |
+| **single RX queue** + **RPS on** | ~4.7 G | ~3.0 G | ≈flat — softirq isn't the cap here; tmasque bypasses it |
+| **multi-queue NIC** (`Combined=8`, **RSS**) | **~7.8 ↑ / 9.6 ↓ G** | **~7.8 G** | both ~6/8, spread |
 
-(First two rows: 4 clients — one 4-core + three 2-core — to a single-queue 8-core gateway. RSS row:
-6 clients — one 4-core + five 2-core — to a multi-queue 8-core gateway, separate non-VPN target. The
-absolute step also reflects the larger fleet; the *shape* — who un-funnels under RPS vs RSS — is the
-point.)
+(All three rows are the same 6-client fleet — one 4-core + five 2-core → a separate non-VPN target — on
+the current 8-core gateway. Full per-scenario numbers in [FULL_MATRIX.md](FULL_MATRIX.md).)
 
 > **Note — tmasque's "jumbo" is 3506, not 9000.** `virtio_net` refuses an XDP-native attach above a
 > **3506** B link MTU, so on the 9000 jumbo underlay tmasque's *outer* packet is capped at 3506
 > (inner tun 3422), whereas kernel WireGuard runs the full **8920**. tmasque reaches ~8 G alongside WG
 > *while carrying a ~2.5× smaller packet* — see [BENCHMARKS.md](BENCHMARKS.md) for the implication.
 
-**The funnel.** With one RX queue, every inbound frame lands on **one core's softirq**, and that one
-core caps the whole 8-core box at ~3.4 G whether it's WireGuard's kernel decrypt or tmasque's single
-AF_XDP RX ring drained by one goroutine. Adding clients does nothing — the second core never lights up.
+**The funnel.** With one RX queue, inbound traffic serializes through a single RX ring, capping the
+8-core box at ~4.4 G (WireGuard) / ~2.8 G (tmasque) — and notably **without pegging a core** (~3–4 of 8
+busy). More clients don't help; the bottleneck is the single queue's serial RX + dispatch, not CPU.
 
-**RPS rescues WireGuard but not tmasque.** RPS re-hashes the kernel's RX softirq across cores, so
-WireGuard jumps **3.4 → 7.3 G**. tmasque's AF_XDP datapath **bypasses the kernel softirq RPS works
-on**, so RPS is inert for it (~3.0 G, unchanged). This is the key asymmetry: *the kernel datapath has
-a kernel knob; the bypass datapath needs the hardware to do the spreading.*
+**RPS doesn't un-funnel here.** RPS re-hashes the kernel's RX *softirq* across cores — but only helps
+when that softirq core is the bottleneck. On this fast box at ~4.4 G it isn't, so WireGuard stays
+~flat (**4.4 → 4.7 G**). tmasque's AF_XDP datapath **bypasses the kernel softirq entirely**, so RPS can
+*never* move it — on any box. *(On an earlier, softirq-bound gateway where WG's RX core was pegged at
+100%, RPS did 2× kernel-WireGuard — the classic demonstration, just not reproduced on this faster
+hardware.)* Either way, a kernel knob isn't the answer for a kernel-bypass datapath.
 
 **RSS removes the funnel for both.** A multi-queue NIC (`hw:vif_multiqueue_enabled` → `Combined=8`)
 gives 8 hardware RX queues, each IRQ-pinned to its own core. WireGuard's softirq spreads natively
 (no RPS needed) and tmasque binds **one AF_XDP `xsk` per RX queue** (`src/xdp/conn.go` already loops
 the queue count; the eBPF redirects by `ctx->rx_queue_index`) — so distinct client flows hash to
-distinct queues→cores. Result: **WG ~9.7 G, tmasque ~8.1 G**, both with ~2–3 cores of headroom. At
-the jumbo inner MTU tmasque now sits right alongside kernel WireGuard on the forward path; at a 1500
-inner MTU WireGuard still leads (see BENCHMARKS.md).
+distinct queues→cores. Result: **WG ~7.8 G (↑) / 9.6 (↓), tmasque ~7.8 G**, both ~6/8 cores. At the
+jumbo inner MTU tmasque sits right alongside kernel WireGuard on the forward path; at a 1500 inner MTU
+WireGuard still leads (see [BENCHMARKS.md](BENCHMARKS.md)).
 
 **The earlier TX-side wall, and its fix.** Before RX was the limit, a live mutex profile showed
 tmasque pinned at ~3 G with the server only ~48% busy — **contention-bound**, ~90% of it on the single

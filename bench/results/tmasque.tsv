@@ -1,0 +1,60 @@
+tmasque	rss	9000	tcp	1up	3.19	3.25	-	c0:3.19 
+tmasque	rss	9000	tcp	1down	2.62	3.11	-	c0:2.62 
+tmasque	rss	9000	tcp	half	7.98	6.23	-	c0:1.89 c1:1.46 c2:0.86 c3:1.16 c4:1.14 c5:1.46 
+tmasque	rss	9000	tcp	allup	7.81	6.09	-	c0:1.64 c1:1.15 c2:1.32 c3:1.16 c4:1.30 c5:1.24 
+tmasque	rss	9000	tcp	alldown	7.73	6.24	-	c0:2.02 c1:1.24 c2:1.26 c3:1.21 c4:1.25 c5:0.76 
+tmasque	rss	9000	udp	1up	1.99	2.51	0.7	c0:1.99 
+tmasque	rss	9000	udp	1down	2.00	2.23	0.2	c0:2.00 
+tmasque	rss	9000	udp	half	5.17	6.04	56.5	c0:0.53 c1:0.57 c2:0.66 c3:0.93 c4:0.95 c5:1.53 
+tmasque	rss	9000	udp	allup	4.52	6.09	62.8	c0:0.85 c1:0.72 c2:0.70 c3:0.71 c4:0.73 c5:0.81 
+tmasque	rss	9000	udp	alldown	6.51	5.34	40.3	c0:1.11 c1:1.04 c2:1.16 c3:1.03 c4:1.07 c5:1.09 
+tmasque	none	9000	tcp	1up	2.74	3.39	-	c0:2.74 
+tmasque	none	9000	tcp	1down	2.52	3.54	-	c0:2.52 
+tmasque	none	9000	tcp	half	2.73	4.04	-	c0:1.93 c1:0.13 c2:0.14 c3:0.18 c4:0.17 c5:0.18 
+tmasque	none	9000	tcp	allup	2.77	3.76	-	c0:1.85 c1:0.19 c2:0.19 c3:0.17 c4:0.19 c5:0.18 
+tmasque	none	9000	tcp	alldown	2.69	3.92	-	c0:1.96 c1:0.13 c2:0.17 c3:0.14 c4:0.14 c5:0.14 
+tmasque	none	9000	udp	1up	1.95	2.21	2.2	c0:1.95 
+tmasque	none	9000	udp	1down	1.99	2.25	0.4	c0:1.99 
+tmasque	none	9000	udp	half	3.07	3.43	70.2	c0:0.00 c1:0.40 c2:0.42 c3:0.75 c4:0.75 c5:0.76 
+tmasque	none	9000	udp	allup	2.84	3.07	79.0	c0:0.88 c1:0.58 c2:0.56 c3:0.27 c4:0.26 c5:0.29 
+tmasque	none	9000	udp	alldown	3.19	3.57	66.8	c0:0.00 c1:0.67 c2:0.61 c3:0.64 c4:0.65 c5:0.61 
+tmasque	rps	9000	tcp	1up	2.82	3.52	-	c0:2.82 
+tmasque	rps	9000	tcp	1down	2.53	3.48	-	c0:2.53 
+tmasque	rps	9000	tcp	half	2.72	3.92	-	c0:1.99 c1:0.10 c2:0.11 c3:0.13 c4:0.15 c5:0.25 
+tmasque	rps	9000	tcp	allup	3.06	3.85	-	c0:2.27 c1:0.16 c2:0.15 c3:0.15 c4:0.17 c5:0.15 
+tmasque	rps	9000	tcp	alldown	2.85	4.20	-	c0:1.94 c1:0.18 c2:0.18 c3:0.18 c4:0.18 c5:0.19 
+tmasque	rps	9000	udp	1up	1.98	2.22	0.9	c0:1.98 
+tmasque	rps	9000	udp	1down	1.99	2.41	0.3	c0:1.99 
+tmasque	rps	9000	udp	half	4.98	3.45	58.7	c0:1.95 c1:0.33 c2:0.47 c3:0.76 c4:0.73 c5:0.75 
+tmasque	rps	9000	udp	allup	4.83	3.23	62.6	c0:1.99 c1:0.75 c2:0.82 c3:0.41 c4:0.41 c5:0.45 
+tmasque	rps	9000	udp	alldown	3.22	3.72	64.6	c0:0.00 c1:0.69 c2:0.57 c3:0.68 c4:0.60 c5:0.68 
+tmasque	rss	1500	tcp	1up	1.70	3.24	-	c0:1.70 
+tmasque	rss	1500	tcp	1down	1.28	3.05	-	c0:1.28 
+tmasque	rss	1500	tcp	half	4.19	6.38	-	c0:0.89 c1:0.65 c2:0.45 c3:0.82 c4:0.78 c5:0.61 
+tmasque	rss	1500	tcp	allup	3.96	6.06	-	c0:0.82 c1:0.56 c2:0.70 c3:0.59 c4:0.68 c5:0.60 
+tmasque	rss	1500	tcp	alldown	4.18	6.34	-	c0:0.97 c1:0.30 c2:0.64 c3:0.84 c4:0.82 c5:0.61 
+tmasque	rss	1500	udp	1up	1.73	3.16	13.0	c0:1.73 
+tmasque	rss	1500	udp	1down	1.61	2.97	20.0	c0:1.61 
+tmasque	rss	1500	udp	half	3.42	6.32	60.7	c0:0.67 c1:0.29 c2:0.41 c3:0.80 c4:0.81 c5:0.45 
+tmasque	rss	1500	udp	allup	3.42	5.99	72.2	c0:1.26 c1:0.43 c2:0.48 c3:0.42 c4:0.46 c5:0.36 
+tmasque	rss	1500	udp	alldown	2.82	5.08	57.8	c0:0.52 c1:0.48 c2:0.34 c3:0.48 c4:0.32 c5:0.68 
+tmasque	none	1500	tcp	1up	1.34	3.36	-	c0:1.34 
+tmasque	none	1500	tcp	1down	1.19	3.24	-	c0:1.19 
+tmasque	none	1500	tcp	half	1.32	3.92	-	c0:0.87 c1:0.07 c2:0.07 c3:0.11 c4:0.09 c5:0.11 
+tmasque	none	1500	tcp	allup	1.43	3.74	-	c0:0.75 c1:0.14 c2:0.14 c3:0.14 c4:0.13 c5:0.13 
+tmasque	none	1500	tcp	alldown	1.24	4.03	-	c0:0.62 c1:0.12 c2:0.13 c3:0.12 c4:0.13 c5:0.12 
+tmasque	none	1500	udp	1up	1.46	3.21	27.0	c0:1.46 
+tmasque	none	1500	udp	1down	1.41	3.19	28.0	c0:1.41 
+tmasque	none	1500	udp	half	1.31	3.39	82.4	c0:0.00 c1:0.15 c2:0.28 c3:0.25 c4:0.33 c5:0.30 
+tmasque	none	1500	udp	allup	1.29	3.74	84.8	c0:0.00 c1:0.32 c2:0.36 c3:0.00 c4:0.31 c5:0.30 
+tmasque	none	1500	udp	alldown	COLLAPSE	~0	ovld	6x1G UDP-R into ~1.3G single-queue pipe; iperf3 -R starves/hangs 
+tmasque	rps	1500	tcp	1up	1.25	3.03	-	c0:1.25 
+tmasque	rps	1500	tcp	1down	1.21	3.38	-	c0:1.21 
+tmasque	rps	1500	tcp	half	1.37	4.08	-	c0:0.48 c1:0.06 c2:0.07 c3:0.26 c4:0.13 c5:0.37 
+tmasque	rps	1500	tcp	allup	1.39	3.81	-	c0:0.72 c1:0.10 c2:0.09 c3:0.23 c4:0.10 c5:0.14 
+tmasque	rps	1500	tcp	alldown	1.19	3.49	-	c0:0.47 c1:0.10 c2:0.11 c3:0.09 c4:0.16 c5:0.27 
+tmasque	rps	1500	udp	1up	1.41	2.94	30.0	c0:1.41 
+tmasque	rps	1500	udp	1down	1.43	3.32	26.0	c0:1.43 
+tmasque	rps	1500	udp	half	2.32	3.34	69.5	c0:NA c1:0.00 c2:0.25 c3:0.92 c4:0.57 c5:0.58 
+tmasque	rps	1500	udp	allup	1.30	3.85	91.5	c0:0.46 c1:0.16 c2:0.27 c3:0.16 c4:0.13 c5:0.12 
+tmasque	rps	1500	udp	alldown	2.38	3.42	69.2	c0:0.00 c1:0.35 c2:0.41 c3:0.90 c4:0.45 c5:0.27 

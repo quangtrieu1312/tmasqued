@@ -74,6 +74,7 @@ type Conn struct {
 	localAddr *net.UDPAddr
 	srcMAC    net.HardwareAddr
 	gwMAC     net.HardwareAddr // next-hop fallback for IPs we haven't learned yet
+	ifindex   int              // WAN interface index (for AF_PACKET-bound forward egress)
 
 	// neigh is a copy-on-write IPv4→MAC neighbour table. We learn it by L2
 	// reverse-path: the source MAC of any inbound frame is, by definition, the
@@ -118,6 +119,7 @@ func NewConn(
 	numQueues int,
 	mode XDPMode,
 	needWakeup bool,
+	quicViaKernel bool, // skip registering xsks_quic → UDP/443 falls through to the kernel
 ) (*Conn, error) {
 	// If localAddr has an unspecified IP (0.0.0.0), resolve the real
     // IP from the interface. The raw Ethernet frames we build need a
@@ -159,10 +161,16 @@ func NewConn(
 		nFill := sock.NumFreeFillSlots()
     	sock.Fill(sock.GetDescs(nFill, true))
 
-		if err := xskQuicMap.Update(uint32(i), uint32(sock.FD()), ebpf.UpdateAny); err != nil {
-			sock.Close()
-			closeSockets(sockets[:i])
-			return nil, fmt.Errorf("xsks_quic update queue %d: %w", i, err)
+		// quicViaKernel: do NOT register xsks_quic, so the XDP prog's UDP/443 redirect
+		// (xdp.c: `if (lookup(xsks_quic)) redirect`) finds no socket and falls through to
+		// XDP_PASS → the kernel UDP stack receives QUIC. The forward-return path (xsks_fwd
+		// reverse-NAT redirect) is unaffected, so SNAT/return still work.
+		if !quicViaKernel {
+			if err := xskQuicMap.Update(uint32(i), uint32(sock.FD()), ebpf.UpdateAny); err != nil {
+				sock.Close()
+				closeSockets(sockets[:i])
+				return nil, fmt.Errorf("xsks_quic update queue %d: %w", i, err)
+			}
 		}
 
 		if err := xskFwdMap.Update(uint32(i), uint32(sock.FD()), ebpf.UpdateAny); err != nil {
@@ -179,6 +187,7 @@ func NewConn(
 		localAddr: frameLocalAddr,
 		srcMAC:    iface.HardwareAddr,
 		gwMAC:     gwMAC,
+		ifindex:   iface.Index,
 		done:      make(chan struct{}),
 		mode: mode,
 		quicCh:      make(chan quicFrame, 4096),
@@ -640,6 +649,10 @@ func (c *Conn) ForwardPump() (*txPump, net.HardwareAddr, net.HardwareAddr, bool)
     idx := int(c.txIdx.Add(1) % uint64(len(c.sockets)))
     return c.txPumps[idx], c.srcMAC, c.gwMAC, c.mode == XDPModeGeneric
 }
+
+// WanIfindex returns the WAN interface index, used to bind an AF_PACKET socket
+// for the kernel-TX (qdisc/GSO) forward egress path.
+func (c *Conn) WanIfindex() int { return c.ifindex }
 
 // WriteBatch sends a batch of QUIC packets in a single XDP TX kick.
 // Called by basicConn.WriteBatch via the nativeBatcher interface check.
