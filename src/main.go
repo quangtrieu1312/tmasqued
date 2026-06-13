@@ -15,6 +15,7 @@ import (
 	"net/netip"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"os/signal"
 	"runtime"
 	"strconv"
@@ -28,6 +29,8 @@ import (
 
 	"github.com/quic-go/quic-go"
 	"github.com/quic-go/quic-go/http3"
+	"golang.org/x/sys/unix"
+
 	"github.com/songgao/water"
 	"github.com/vishvananda/netlink"
 	"github.com/yosida95/uritemplate/v3"
@@ -51,18 +54,71 @@ var mu *sync.RWMutex
 // (ECMP/LACP-style) so a flow never crosses tunnels (no cross-tunnel reorder)
 // while different flows spread across tunnels/cores.
 var ipToTunChan map[netip.Addr][]chan *utility.Packet
+
+// afxdpConn is the PRIMARY NIC's AF_XDP Conn (the QUIC-listen / WAN NIC). It drives
+// the existing WAN forward (branch-4) and handleConn. Phase 2 makes branch-3 pick a
+// per-egress-NIC Conn from egressNICs.
 var afxdpConn *xdp.Conn
 
-// xdpLoaderRef lets GracefullyShutDown detach the XDP bpf_link before restoring
-// the WAN MTU (virtio_net rejects MTU > 3506 while XDP-native is attached).
+// nicEgress is one real NIC's datapath: its AF_XDP Conn and the IPv4 used as the
+// SNAT source for traffic egressing it (the rev-NAT table is keyed by this IP, so
+// flows out different NICs coexist).
+type nicEgress struct {
+	name     string
+	conn     *xdp.Conn
+	addr     netip.Addr
+	combined int
+}
+
+// egressNICs holds every real NIC's datapath (one per attached NIC). Used to pick
+// the right egress for a destination in the multi-NIC forward fast path.
+var egressNICs []nicEgress
+
+// xdpLoaderRef / xdpLoadersRef let GracefullyShutDown detach the XDP bpf_link(s)
+// before restoring NIC MTUs (virtio_net rejects MTU > 3506 while XDP-native is
+// attached). xdpLoaderRef is the primary (back-compat); xdpLoadersRef is all NICs'.
 var xdpLoaderRef *xdp.Loader
+var xdpLoadersRef []*xdp.Loader
 
 // wanIfaceName is captured at startup (the signal-handler goroutine's ctx is the
-// pre-config.Load one, so it can't read WAN_INTERFACE from ctx).
+// pre-config.Load one, so it can't read WAN_INTERFACE from ctx). It is the primary
+// (QUIC-listen) NIC's name.
 var wanIfaceName string
 var serverTunIP netip.Addr
 var tunChanDrops atomic.Uint64
 var pktChanDrops atomic.Uint64
+
+// virtPrefix is the VPN's virtual subnet (VIRT_CIDR) as a netip.Prefix, used by
+// the forward router to recognise client-to-client traffic. localLANs are the
+// directly-connected non-WAN/non-tun subnets the server bridges its clients onto.
+// Both set once at startup, read-only on the forward hot path.
+var virtPrefix netip.Prefix
+var localLANs []netip.Prefix
+
+// lanRoute pairs a directly-connected LAN subnet with the egress NIC (index into
+// egressNICs) that owns it, for the multi-NIC LAN fast path (forwardOne branch-3).
+// egIdx >= 0  → that real NIC's AF_XDP/XDP datapath: userspace SNAT to its IP +
+//               its XDP NAT-reverse for the return (the WAN's treatment).
+// egIdx == -1 → no XDP NIC owns the subnet (docker0, a coexisting VPN's tun) →
+//               transparent kernel bridge (ip_forward + masquerade), as before.
+// Built once at startup after egressNICs; read-only on the forward hot path.
+type lanRoute struct {
+	prefix netip.Prefix
+	egIdx  int
+}
+
+var lanRoutes []lanRoute
+
+// Forward-router counters (served at /debug/vars):
+//
+//	c2c_sends     = inner packets delivered straight down a peer's tunnel (no SNAT)
+//	c2c_no_peer   = vIP destination with no live tunnel (dropped, not leaked to WAN)
+//	lan_forwards  = packets bridged out a local LAN NIC (no SNAT)
+var (
+	c2cSends    = expvar.NewInt("c2c_sends")
+	c2cNoPeer   = expvar.NewInt("c2c_no_peer")
+	lanForwards = expvar.NewInt("lan_forwards")
+)
 
 // fwdAddDrops counts forward packets the batch refused to enqueue (the
 // ForwardBatch.Add return value was previously ignored → silent drop). Served
@@ -104,6 +160,16 @@ const (
 // If this is nonzero during a download test, a flow is split between this
 // producer and the AF_XDP one (utility.TunAdapterSends) → reorder source.
 var tunLoopSends atomic.Uint64
+
+// writerPinSeq assigns round-robin CPUs to pinned forward writers (FORWARD_WRITER_PIN=1).
+var writerPinSeq atomic.Uint64
+
+// fwdRounds/fwdRoundPkts measure forward drain-round chunk size (avg pkts the
+// writer processes per wakeup = fwd_round_pkts / fwd_rounds).
+var (
+	fwdRounds    = expvar.NewInt("fwd_rounds")
+	fwdRoundPkts = expvar.NewInt("fwd_round_pkts")
+)
 
 func main() {
 	// M3 diagnosis (perf branch): enable block + mutex profiling so /debug/pprof/
@@ -150,6 +216,11 @@ func main() {
 	serverTunIP, err = netip.ParseAddr(virtIP)
 	if err != nil {
 		logger.Fatal(fmt.Sprintf("failed to parse %v: %v", virtIP, err))
+	}
+	if vp, perr := netip.ParsePrefix(virtCIDR); perr == nil {
+		virtPrefix = vp.Masked()
+	} else {
+		logger.Fatal(fmt.Sprintf("failed to parse VIRT_CIDR prefix %v: %v", virtCIDR, perr))
 	}
 
 	ipProtocol := 0
@@ -216,11 +287,19 @@ func main() {
 	if !wanAddr.IsValid() {
 		logger.Fatal(fmt.Sprintf("no usable IP on %s", ifaceName))
 	}
-	// Upload-forward egress mode (config; default off). GSO needs the main tun opened
-	// IFF_VNET_HDR so the coalescer can write TSO super-frames straight into it (no
-	// dedicated tmfwd0 device). vhost still uses its own tmvhost0 (Phase 2).
-	forwardTunGSO := ctxBool(ctx, "FORWARD_TUN_GSO")
+	localLANs = buildLocalLANs(ifaceName)
+	if logger.ShouldLog(logger.INFO) {
+		logger.Info(fmt.Sprintf("forward router: virt=%s wan=%s/%s localLANs=%v", virtPrefix, wanAddr, ifaceName, localLANs))
+	}
+	// Upload-forward egress mode. GSO needs the main tun opened IFF_VNET_HDR so the
+	// coalescer can write TSO super-frames straight into it (no dedicated tmfwd0
+	// device). vhost uses its own dedicated TAP "tmvhost0" — "tm"-prefixed so the standard tm+ iptables rules cover it; a true fold into the main tun is kernel-blocked (tun_xdp_one is Ethernet-only, see memory/QUIC_DCO notes).
+	// DEFAULT = tun-GSO: best aggregate across every measured regime, decisively so
+	// on single-queue NICs (~2-4x AF_XDP-TX under none/rps; ≈ AF_XDP-TX under rss —
+	// 16-core matrix, kernels 6.8 + 6.17). Explicit FORWARD_TUN_GSO=false restores
+	// the AF_XDP-TX egress; FORWARD_TUN_VHOST=true (without GSO set) selects vhost.
 	forwardTunVhost := ctxBool(ctx, "FORWARD_TUN_VHOST")
+	forwardTunGSO := ctxBoolDefault(ctx, "FORWARD_TUN_GSO", !forwardTunVhost)
 	utility.SetForwardMode(forwardTunGSO, forwardTunVhost)
 
 	netBitSize, _ := virtSubnet.Mask.Size()
@@ -466,39 +545,79 @@ func GracefullyShutDown(ctx context.Context) {
 		logger.Info("Shutting down")
 	}
 	db.CloseConnection()
-	// Detach the XDP bpf_link first (virtio_net rejects MTU > 3506 while XDP-native
-	// is attached), then restore the WAN MTU that bootstrap/004 scaled down.
-	if xdpLoaderRef != nil {
+	// Detach every NIC's XDP bpf_link first (virtio_net rejects MTU > 3506 while
+	// XDP-native is attached), then restore the WAN MTU that bootstrap/004 scaled down.
+	for _, l := range xdpLoadersRef {
+		l.Close()
+	}
+	if len(xdpLoadersRef) == 0 && xdpLoaderRef != nil {
 		xdpLoaderRef.Close()
 	}
 	restoreWanMTU(ctx)
+	restoreWanOffloads()
 	os.Exit(0)
 }
 
-// restoreWanMTU reverts the WAN interface to the original MTU saved by
-// bootstrap/004 (in /etc/tmasqued/<iface>.wan_mtu.orig) before it scaled the link
-// down to the XDP-native virtio limit. No-op if nothing was scaled (file absent).
-func restoreWanMTU(ctx context.Context) {
-	iface := wanIfaceName
-	if iface == "" {
-		return
-	}
-	origFile := "/etc/tmasqued/" + iface + ".wan_mtu.orig"
-	data, err := os.ReadFile(origFile)
-	if err != nil {
-		return // nothing was scaled, or already restored
-	}
-	mtu, err := strconv.Atoi(strings.TrimSpace(string(data)))
-	if err != nil || mtu <= 0 {
-		return
-	}
-	if link, e := netlink.LinkByName(iface); e == nil {
-		e2 := netlink.LinkSetMTU(link, mtu)
-		if logger.ShouldLog(logger.INFO) {
-			logger.Info(fmt.Sprintf("Restored WAN %s MTU to %d (err=%v)", iface, mtu, e2))
+// restoreWanOffloads reverts the offload flags that bootstrap/004 disabled for
+// XDP-native (gro/lro) on EVERY NIC it pinned, from the per-NIC states saved in
+// /etc/tmasqued/<iface>.offloads.orig ("<flag> <on|off>" per line). bootstrap pins
+// all real NICs (the WAN + any bridged LAN NIC), so restore globs the saved files
+// rather than only wanIfaceName. No-op when nothing was saved; each file is removed
+// after its NIC is restored.
+func restoreWanOffloads() {
+	files, _ := filepath.Glob("/etc/tmasqued/*.offloads.orig")
+	for _, origFile := range files {
+		iface := strings.TrimSuffix(filepath.Base(origFile), ".offloads.orig")
+		if iface == "" {
+			continue
 		}
+		data, err := os.ReadFile(origFile)
+		if err != nil {
+			continue
+		}
+		for _, line := range strings.Split(string(data), "\n") {
+			fields := strings.Fields(line)
+			if len(fields) != 2 || (fields[1] != "on" && fields[1] != "off") {
+				continue
+			}
+			out, e := exec.Command("ethtool", "-K", iface, fields[0], fields[1]).CombinedOutput()
+			if logger.ShouldLog(logger.INFO) {
+				logger.Info(fmt.Sprintf("Restored %s offload %s=%s (err=%v %s)",
+					iface, fields[0], fields[1], e, strings.TrimSpace(string(out))))
+			}
+		}
+		os.Remove(origFile)
 	}
-	os.Remove(origFile)
+}
+
+// restoreWanMTU reverts every NIC that bootstrap/004 scaled down to its original MTU,
+// saved per-NIC in /etc/tmasqued/<iface>.wan_mtu.orig before the scale-down to the
+// XDP-native virtio limit. Globs the saved files so all pinned NICs (WAN + bridged
+// LAN NICs) are restored, not just wanIfaceName. No-op when nothing was scaled.
+func restoreWanMTU(ctx context.Context) {
+	files, _ := filepath.Glob("/etc/tmasqued/*.wan_mtu.orig")
+	for _, origFile := range files {
+		iface := strings.TrimSuffix(filepath.Base(origFile), ".wan_mtu.orig")
+		if iface == "" {
+			continue
+		}
+		data, err := os.ReadFile(origFile)
+		if err != nil {
+			continue
+		}
+		mtu, err := strconv.Atoi(strings.TrimSpace(string(data)))
+		if err != nil || mtu <= 0 {
+			os.Remove(origFile)
+			continue
+		}
+		if link, e := netlink.LinkByName(iface); e == nil {
+			e2 := netlink.LinkSetMTU(link, mtu)
+			if logger.ShouldLog(logger.INFO) {
+				logger.Info(fmt.Sprintf("Restored %s MTU to %d (err=%v)", iface, mtu, e2))
+			}
+		}
+		os.Remove(origFile)
+	}
 }
 
 // ctxBool reads a boolean config option from ctx (loaded from tmasqued.conf by
@@ -511,10 +630,65 @@ func ctxBool(ctx context.Context, key string) bool {
 	return false
 }
 
+// ctxBoolDefault is ctxBool with an explicit default: the default applies when the
+// key is absent from the config OR present but unparseable; an explicit valid
+// "false"/"true" always wins. Use for options whose shipped default is not false.
+func ctxBoolDefault(ctx context.Context, key string, def bool) bool {
+	if v, ok := ctx.Value(key).(string); ok {
+		if b, err := strconv.ParseBool(v); err == nil {
+			return b
+		}
+	}
+	return def
+}
+
 // createTunTapDevice creates the main MASQUE tun (multiqueue). When gso is set the
 // device is opened IFF_VNET_HDR + TUNSETOFFLOAD (via water), so the read side splits
 // kernel GSO super-frames and the upload-forward coalescer can write TSO super-frames
 // straight to GSOFd. All queues share the same flags.
+// buildLocalLANs enumerates directly-connected IPv4 subnets on every interface
+// EXCEPT the WAN uplink, the tun/tap VPN devices, and loopback. A forwarded inner
+// packet whose destination falls in one of these is bridged transparently out that
+// NIC (kernel ip_forward, no SNAT). Read once at startup; read-only thereafter.
+func buildLocalLANs(wanIface string) []netip.Prefix {
+	var out []netip.Prefix
+	links, err := netlink.LinkList()
+	if err != nil {
+		return out
+	}
+	for _, l := range links {
+		name := l.Attrs().Name
+		// Exclude only what genuinely must NOT be a kernel-forward LAN target:
+		//   - the WAN uplink: its subnet egresses via the AF_XDP fast path (branch-4),
+		//     not the kernel forward, so it must stay out of localLANs.
+		//   - loopback: never a forward destination.
+		//   - OUR OWN datapath devices ("tm" prefix — tm0 main tun, tmvhost0, tmnapi0):
+		//     the vIP overlay is handled by branch-2 (c2c), not a bridge.
+		// Everything else with a connected IPv4 subnet is a valid branch-3 kernel-forward
+		// target: docker0, custom bridges, other LAN NICs — AND crucially ANOTHER VPN the
+		// operator runs (wireguard wg*, openvpn tun*/tap*): naming ours "tm" lets us bridge
+		// to subnets reached via a coexisting VPN instead of wrongly excluding tun*/tap*.
+		// (ip_forward + the `! -o tm+` masquerade route it out the right NIC.)
+		if name == wanIface || name == "lo" || strings.HasPrefix(name, "tm") {
+			continue
+		}
+		addrs, err := netlink.AddrList(l, netlink.FAMILY_V4)
+		if err != nil {
+			continue
+		}
+		for _, a := range addrs {
+			ip, ok := netip.AddrFromSlice(a.IP.To4())
+			if !ok {
+				continue
+			}
+			ones, _ := a.IPNet.Mask.Size()
+			p := netip.PrefixFrom(ip.Unmap(), ones).Masked()
+			out = append(out, p)
+		}
+	}
+	return out
+}
+
 func createTunTapDevice(ctx context.Context, virtIp string, virtPrefixLen int, mtu int, gso bool) ([]*water.Interface, error) {
 	numQueues := runtime.NumCPU()
 	// TUN_QUEUES overrides the tun-read goroutine count (default = NumCPU). Set to 1
@@ -526,11 +700,19 @@ func createTunTapDevice(ctx context.Context, virtIp string, virtPrefixLen int, m
 	}
 	devs := make([]*water.Interface, numQueues)
 
-	// First device — let OS assign name
+	// First device — explicitly named "tm0" (NOT the kernel's auto "tun%d"). The "tm"
+	// prefix (tmasque) lets the forward router (buildLocalLANs) and the iptables rules
+	// tell OUR datapath devices apart from ANY OTHER VPN the operator runs alongside us:
+	// wireguard/openvpn use tun*/tap*/wg*, which we now correctly treat as bridgeable
+	// LANs instead of excluding them. Delete a leftover tm0 from a prior crash first.
 	var err error
+	if leftover, e := netlink.LinkByName("tm0"); e == nil {
+		_ = netlink.LinkDel(leftover)
+	}
 	devs[0], err = water.New(water.Config{
 		DeviceType: water.TUN,
 		PlatformSpecificParams: water.PlatformSpecificParams{
+			Name:       "tm0",
 			MultiQueue: true,
 			GSO:        gso,
 		},
@@ -593,75 +775,112 @@ func createTunTapDevice(ctx context.Context, virtIp string, virtPrefixLen int, m
 	return devs, nil
 }
 
+// firstIPv4 returns the first non-link-local IPv4 address configured on ifaceName.
+// This is the SNAT source IP for traffic egressing that NIC.
+func firstIPv4(ifaceName string) (netip.Addr, error) {
+	link, err := netlink.LinkByName(ifaceName)
+	if err != nil {
+		return netip.Addr{}, fmt.Errorf("link %s: %w", ifaceName, err)
+	}
+	addrs, err := netlink.AddrList(link, netlink.FAMILY_V4)
+	if err != nil {
+		return netip.Addr{}, fmt.Errorf("addrs %s: %w", ifaceName, err)
+	}
+	for _, addr := range addrs {
+		a, ok := netip.AddrFromSlice(addr.IP)
+		if !ok || a.IsLinkLocalUnicast() {
+			continue
+		}
+		return a.Unmap(), nil
+	}
+	return netip.Addr{}, fmt.Errorf("no usable IPv4 on %s", ifaceName)
+}
+
+// maximizeChannelsFor returns the combined-channel count to use for ifaceName.
+// MAXIMIZE_CHANNELS (default true) raises combined channels to the hardware max so
+// the datagram TX path can fan out across every hardware ring; set false to honor an
+// externally-configured count (e.g. a regime sweep pinning combined=1). Best-effort:
+// always returns >= 1.
+func maximizeChannelsFor(ctx context.Context, ifaceName string) int {
+	var finalCombined int
+	if v := ctx.Value("MAXIMIZE_CHANNELS"); v == nil || ctxBool(ctx, "MAXIMIZE_CHANNELS") {
+		fc, mErr := xdp.MaximizeChannels(ifaceName)
+		finalCombined = fc
+		if mErr != nil && logger.ShouldLog(logger.INFO) {
+			logger.Info(fmt.Sprintf("NIC %s: MaximizeChannels best-effort: %v (combined=%d)", ifaceName, mErr, finalCombined))
+		}
+	} else {
+		finalCombined = 1
+		if ci, e := xdp.GetChannels(ifaceName); e == nil {
+			finalCombined = ci.CurrentCombined
+		}
+	}
+	if finalCombined < 1 {
+		finalCombined = 1 // a driver can report Combined:0; guard before DatagramSendBuckets
+	}
+	return finalCombined
+}
+
 func run(ctxt context.Context, upChan chan<- bool, bindTo netip.AddrPort, ipProtocol uint8) error {
 	ctx, cancel := context.WithCancel(ctxt)
 	defer cancel()
-	ifaceName := ctxt.Value("WAN_INTERFACE").(string)
-	xdpLoader, err := xdp.Load(ifaceName)
+	// ---- Multi-NIC AF_XDP/XDP datapath ----
+	// WAN_INTERFACE is OPTIONAL: we auto-detect every real NIC and attach the XDP
+	// program to ALL of them (so the reverse-NAT return fast path fires regardless of
+	// which NIC a reply arrives on). QUIC LISTEN (xsks_quic) is registered only on
+	// WAN_INTERFACE when it is set; when unset we listen on every real NIC.
+	wanIface, _ := ctxt.Value("WAN_INTERFACE").(string) // "" => auto / listen on all
+	nicNames, err := xdp.DetectRealNICs()
 	if err != nil {
-		return fmt.Errorf("loading XDP program: %w", err)
+		return fmt.Errorf("detecting real NICs: %w", err)
 	}
-	xdpLoaderRef = xdpLoader // for GracefullyShutDown's WAN-MTU restore
-	wanIfaceName = ifaceName // captured here; the shutdown goroutine's ctx is pre-config
-	defer xdpLoader.Close()
+	if len(nicNames) == 0 {
+		return fmt.Errorf("no real NICs detected to attach the datapath")
+	}
+	quicListen := map[string]bool{}
+	if wanIface != "" {
+		inSet := false
+		for _, n := range nicNames {
+			if n == wanIface {
+				inSet = true
+				break
+			}
+		}
+		if !inSet {
+			return fmt.Errorf("WAN_INTERFACE %q is not among the detected real NICs %v", wanIface, nicNames)
+		}
+		quicListen[wanIface] = true
+	} else {
+		for _, n := range nicNames {
+			quicListen[n] = true
+		}
+	}
+
+	loaders, err := xdp.LoadMultiNIC(nicNames)
+	if err != nil {
+		return fmt.Errorf("loading XDP on %v: %w", nicNames, err)
+	}
+	for _, l := range loaders {
+		defer l.Close()
+	}
+	xdpLoadersRef = loaders // for GracefullyShutDown's per-NIC XDP-detach + MTU restore
+	if len(loaders) > 0 {
+		xdpLoaderRef = loaders[0]
+	}
 	if logger.ShouldLog(logger.INFO) {
-		logger.Info(fmt.Sprintf("XDP mode: %s", xdpLoader.Mode()))
+		for _, l := range loaders {
+			logger.Info(fmt.Sprintf("XDP attached on %s (mode=%s, quic-listen=%v)",
+				l.Iface().Name, l.Mode(), quicListen[l.Iface().Name]))
+		}
 	}
+
 	natTable, err := xdp.OpenNatTable()
 	if err != nil {
 		return fmt.Errorf("opening NAT table: %w", err)
 	}
 	defer natTable.Close()
 
-	link, err := netlink.LinkByName(ifaceName)
-	if err != nil {
-		return fmt.Errorf("failed to get %s interface: %w", ifaceName, err)
-	}
-	addrs, err := netlink.AddrList(link, netlink.FAMILY_V4)
-	if err != nil {
-		return fmt.Errorf("failed to get addresses for %s: %w", ifaceName, err)
-	}
-	var wanAddr netip.Addr
-	for _, addr := range addrs {
-		a, ok := netip.AddrFromSlice(addr.IP)
-		if !ok {
-			continue
-		}
-		if !a.IsLinkLocalUnicast() {
-			wanAddr = a.Unmap()
-			break
-		}
-	}
-	if !wanAddr.IsValid() {
-		return fmt.Errorf("no usable IP on %s", ifaceName)
-	}
-	iface, err := net.InterfaceByName(ifaceName)
-	if err != nil {
-		return fmt.Errorf("interface %s: %w", ifaceName, err)
-	}
 	localAddr := &net.UDPAddr{IP: bindTo.Addr().AsSlice(), Port: int(bindTo.Port())}
-	// Auto-detect + maximize NIC combined channels BEFORE binding AF_XDP. This
-	// frees all hardware TX rings the driver can offer, so the datagram TX
-	// path can fan out across them. On a fresh boot the OCI NICs typically
-	// report combined=1 even though the hardware supports more — auto-setting
-	// here makes the perf path symmetric with WireGuard's multi-queue TX.
-	// Failure is non-fatal: we fall back to whatever the soft limit was.
-	finalCombined, err := xdp.MaximizeChannels(ifaceName)
-	if err != nil {
-		if logger.ShouldLog(logger.INFO) {
-			logger.Info(fmt.Sprintf("NIC %s: MaximizeChannels best-effort: %v (continuing with %d queue)",
-				ifaceName, err, finalCombined))
-		}
-	}
-	nicQueues, err := xdp.GetQueueInfo(ifaceName)
-	if err != nil {
-		return fmt.Errorf("reading NIC queue info for %s: %w", ifaceName, err)
-	}
-	if logger.ShouldLog(logger.INFO) {
-		logger.Info(fmt.Sprintf("NIC %s: combined channels=%d active RX queues=%d — datagram TX will use %d buckets",
-			ifaceName, finalCombined, nicQueues.RX, finalCombined))
-	}
-
 	// XDP_USE_NEED_WAKEUP skips the per-batch sendto kick on the TX path. On by
 	// default; kill switch: set XDP_NEED_WAKEUP=false in the config.
 	needWakeup := true
@@ -669,24 +888,101 @@ func run(ctxt context.Context, upChan chan<- bool, bindTo netip.AddrPort, ipProt
 		needWakeup, _ = strconv.ParseBool(v)
 	}
 	// QUIC_KERNEL_UDP=1: run the QUIC transport on a KERNEL UDP socket instead of
-	// AF_XDP. The gateway's AF_XDP RX on this reprovisioned virtio reorders received
-	// packets (~7.6% inner-TCP reorder, the RX twin of the AF_XDP-TX reorder) — the
-	// kernel RX path is in-order (kernel-TCP = 1% OOO). We skip registering xsks_quic
-	// (so XDP passes UDP/443 to the kernel) and hand quic-go a net.ListenUDP socket;
-	// the AF_XDP conn is kept ONLY for the forward-return dispatch (xsks_fwd). The
-	// forward egress (TUN/AF_XDP) is orthogonal and unchanged.
+	// AF_XDP. We skip registering xsks_quic on every NIC (so XDP passes UDP/443 to the
+	// kernel) and hand quic-go a net.ListenUDP socket; the AF_XDP Conns are kept ONLY
+	// for the forward-return dispatch (xsks_fwd).
 	quicKernelUDP := os.Getenv("QUIC_KERNEL_UDP") == "1"
-	afxdpConn, err = xdp.NewConn(iface, xdpLoader.XskQuicMap(), xdpLoader.XskFwdMap(), localAddr, nicQueues.RX, xdpLoader.Mode(), needWakeup, quicKernelUDP)
-	if err != nil {
-		return fmt.Errorf("creating AF_XDP conn: %w", err)
-	}
-	defer afxdpConn.Close()
+
+	// Build one AF_XDP Conn per real NIC. QUIC-listen NICs register xsks_quic; ALL
+	// NICs register xsks_fwd (reverse-NAT return). Channels are maximized per NIC so
+	// every egress has its TX rings (Phase 2). A NIC without a usable IPv4 is skipped.
 	sessionTable := xdp.NewSessionTable()
-	afxdpConn.SetForwardHandler(sessionTable.Deliver)
+	var listenConns []*xdp.Conn
+	egressNICs = egressNICs[:0]
+	for _, l := range loaders {
+		ifc := l.Iface()
+		addr, aerr := firstIPv4(ifc.Name)
+		if aerr != nil {
+			if logger.ShouldLog(logger.WARN) {
+				logger.Warn(fmt.Sprintf("NIC %s: %v — skipping datapath on it", ifc.Name, aerr))
+			}
+			continue
+		}
+		combined := maximizeChannelsFor(ctx, ifc.Name)
+		nq, qerr := xdp.GetQueueInfo(ifc.Name)
+		if qerr != nil {
+			if logger.ShouldLog(logger.WARN) {
+				logger.Warn(fmt.Sprintf("NIC %s queue info failed, skipping datapath on it: %v", ifc.Name, qerr))
+			}
+			continue
+		}
+		registerQuic := quicListen[ifc.Name] && !quicKernelUDP
+		conn, cerr := xdp.NewConn(ifc, l.XskQuicMap(), l.XskFwdMap(), localAddr, nq.RX, l.Mode(), needWakeup, !registerQuic)
+		if cerr != nil {
+			// Non-fatal: skip the datapath on this NIC (its XDP stays attached but
+			// XDP_PASSes everything since its xsk maps are empty). The required
+			// QUIC-listen NIC(s) are verified after the loop.
+			if logger.ShouldLog(logger.WARN) {
+				logger.Warn(fmt.Sprintf("AF_XDP conn on %s failed, skipping datapath on it: %v", ifc.Name, cerr))
+			}
+			continue
+		}
+		defer conn.Close()
+		conn.SetForwardHandler(sessionTable.Deliver)
+		egressNICs = append(egressNICs, nicEgress{name: ifc.Name, conn: conn, addr: addr, combined: combined})
+		if registerQuic {
+			listenConns = append(listenConns, conn)
+		}
+		if logger.ShouldLog(logger.INFO) {
+			logger.Info(fmt.Sprintf("NIC %s: addr=%s combined=%d RX-queues=%d quic-listen=%v",
+				ifc.Name, addr, combined, nq.RX, registerQuic))
+		}
+	}
+	if len(egressNICs) == 0 {
+		return fmt.Errorf("no NIC with a usable IPv4 to bind the datapath")
+	}
+
+	// Pair each directly-connected LAN subnet with the egress NIC that owns it (the
+	// one whose own IPv4 sits inside the subnet). A subnet with no real XDP NIC
+	// (docker0, a coexisting VPN tun) keeps egIdx == -1 → kernel bridge fallback.
+	lanRoutes = lanRoutes[:0]
+	for _, p := range localLANs {
+		egIdx := -1
+		for i := range egressNICs {
+			if p.Contains(egressNICs[i].addr) {
+				egIdx = i
+				break
+			}
+		}
+		lanRoutes = append(lanRoutes, lanRoute{prefix: p, egIdx: egIdx})
+		if logger.ShouldLog(logger.INFO) {
+			owner := "kernel-bridge (no XDP NIC)"
+			if egIdx >= 0 {
+				owner = fmt.Sprintf("%s XDP SNAT %s", egressNICs[egIdx].name, egressNICs[egIdx].addr)
+			}
+			logger.Info(fmt.Sprintf("LAN route %s -> %s", p, owner))
+		}
+	}
+
+	// Primary egress = the first QUIC-listen NIC (the WAN), else the first NIC. It
+	// drives the existing WAN forward (branch-4) + handleConn (afxdpConn/wanAddr) and
+	// supplies the DatagramSendBuckets count.
+	primary := egressNICs[0]
+	for _, e := range egressNICs {
+		if quicListen[e.name] {
+			primary = e
+			break
+		}
+	}
+	afxdpConn = primary.conn
+	wanAddr := primary.addr
+	wanIfaceName = primary.name
+	finalCombined := primary.combined
 
 	// quicConn is what quic-go listens on: a kernel UDP socket (QUIC_KERNEL_UDP=1) or
-	// the AF_XDP conn (default). Either way afxdpConn drives the forward-return path.
-	var quicConn net.PacketConn = afxdpConn
+	// the merged multi-NIC AF_XDP transport (default; a single Conn unwrapped when only
+	// one NIC listens). The per-NIC Conns drive the forward-return path either way.
+	var quicConn net.PacketConn
 	if quicKernelUDP {
 		uc, uerr := net.ListenUDP("udp", localAddr)
 		if uerr != nil {
@@ -696,6 +992,14 @@ func run(ctxt context.Context, upChan chan<- bool, bindTo netip.AddrPort, ipProt
 		quicConn = uc
 		if logger.ShouldLog(logger.INFO) {
 			logger.Info(fmt.Sprintf("QUIC transport: KERNEL UDP on %v (AF_XDP RX bypassed for 443)", localAddr))
+		}
+	} else {
+		if len(listenConns) == 0 {
+			return fmt.Errorf("no QUIC-listen NIC available (WAN_INTERFACE=%q, detected %v)", wanIface, nicNames)
+		}
+		quicConn = xdp.NewMultiConn(listenConns)
+		if logger.ShouldLog(logger.INFO) {
+			logger.Info(fmt.Sprintf("QUIC transport: AF_XDP on %d NIC(s)", len(listenConns)))
 		}
 	}
 	cert, err := tls.LoadX509KeyPair(constants.SERVER_CERT_PATH, constants.SERVER_KEY_PATH)
@@ -708,7 +1012,7 @@ func run(ctxt context.Context, upChan chan<- bool, bindTo netip.AddrPort, ipProt
 	}
 	caCertPEM, err := os.ReadFile(constants.CLIENT_CA_PATH)
 	if err != nil {
-		return fmt.Errorf("Cannot read client CA:", err)
+		return fmt.Errorf("cannot read client CA: %w", err)
 	}
 	ok := certPool.AppendCertsFromPEM(caCertPEM)
 	if !ok {
@@ -811,7 +1115,9 @@ func run(ctxt context.Context, upChan chan<- bool, bindTo netip.AddrPort, ipProt
 		}(dev, i)
 	}
 	mux.HandleFunc("/vpn", func(w http.ResponseWriter, r *http.Request) {
-		fmt.Printf("DEBUG /vpn handler reached, TLS peer certs: %d\n", len(r.TLS.PeerCertificates))
+		if logger.ShouldLog(logger.DEBUG) {
+			logger.Debug(fmt.Sprintf("/vpn handler reached, TLS peer certs: %d", len(r.TLS.PeerCertificates)))
+		}
 		commonName := r.TLS.PeerCertificates[0].Subject.CommonName
 		clientId, err := strconv.ParseInt(commonName, 10, 64)
 		if err != nil {
@@ -904,11 +1210,12 @@ func handleConn(ctx context.Context, tunChan chan *utility.Packet, conn *connect
 	if logger.ShouldLog(logger.DEBUG) {
 		logger.Debug("Start connectip flow")
 	}
-	// Get the next unassigned address
-	// And assign prefix = IP/32 to the client
-	// Note:
-	// We can assign any subnet size here but I'm using /32 for simplicity
-	// I may want to go back to this hardcoded number when I see issues for site-to-side VPN
+	// Get the next unassigned address. The client tun gets a /32 (RFC 9484
+	// ADDRESS_ASSIGN requires a canonical prefix — a host address can't carry a /10).
+	// Whole-subnet reachability for client-to-client is done the protocol-correct
+	// way instead: VIRT_CIDR is appended to the advertised routes below, which both
+	// installs the on-link route on the client AND makes the server's ingress ACL
+	// accept peer-vIP destinations (no per-peer resource grant needed).
 	clientId := ctx.Value("clientId").(int64)
 	peerAddr, perr := service.AssignIPToClient(setupCtx, clientId)
 	if logger.ShouldLog(logger.INFO) {
@@ -930,7 +1237,7 @@ func handleConn(ctx context.Context, tunChan chan *utility.Packet, conn *connect
 	}
 	sessionTable.Register(sess, tunCount)
 	defer sessionTable.RemoveSession(sess)
-	bitmask := 32
+	bitmask := 32 // RFC 9484 ADDRESS_ASSIGN requires a canonical prefix; a host gets /32.
 	ipPrefix := netip.PrefixFrom(addr, bitmask)
 	if err := conn.AssignAddresses(setupCtx, []netip.Prefix{ipPrefix}); err != nil {
 		return fmt.Errorf("failed to assign addresses: %w", err)
@@ -963,6 +1270,13 @@ func handleConn(ctx context.Context, tunChan chan *utility.Packet, conn *connect
 		connectipRoute := connectip.IPRoute{StartIP: r.Addr(), EndIP: utility.LastIPAddr(r), IPProtocol: ipProtocol}
 		clientRoutes = append(clientRoutes, connectipRoute)
 	}
+	// Client-to-client reachability is governed ENTIRELY by the resource/role model,
+	// NOT hardcoded: client A can reach client B only if A is granted a resource that
+	// covers B's vIP (and B granted one covering A's, for the return path). That grant
+	// is what installs the route on the client AND makes connect-ip's ingress ACL
+	// accept the peer dst. Only then does forwardOne's branch-2 deliver the packet
+	// down B's tunnel. We do NOT advertise VIRT_CIDR by default — that would make
+	// every client reachable to every other, breaking isolation.
 	if err := conn.AdvertiseRoute(setupCtx, clientRoutes); err != nil {
 		return fmt.Errorf("failed to advertise route: %w", err)
 	}
@@ -1013,15 +1327,75 @@ func handleConn(ctx context.Context, tunChan chan *utility.Packet, conn *connect
 		}
 		defer batch.Close()
 
-		// Upload-path inner-TCP-seq resequencer (FORWARD_UPLOAD_RESEQ=1). connect-ip
+		// Per-egress-NIC forward batches for the multi-NIC LAN fast path (branch-3),
+		// indexed parallel to egressNICs. ForwardBatch is single-owner, so each writer
+		// goroutine (one per connection) builds its own. The primary/WAN slot reuses
+		// `batch`. In tun-GSO/vhost mode every batch writes the (already-SNAT'd) packet
+		// to the main tun and the kernel ip_forwards it out the NIC by destination route;
+		// in AF_XDP-TX mode each batch TXes out its own NIC's pump. A NIC whose batch
+		// fails to build stays nil → forwardOne falls back to the kernel bridge for it.
+		lanBatch := make([]*utility.ForwardBatch, len(egressNICs))
+		for i := range egressNICs {
+			if egressNICs[i].conn == afxdpConn {
+				lanBatch[i] = batch
+				continue
+			}
+			p, sm, dm, _ := egressNICs[i].conn.ForwardPump()
+			lb, lerr := utility.NewForwardBatch(p, sm, dm, egressNICs[i].conn.WanIfindex(), tunTapDevice[0].GSOFd())
+			if lerr != nil {
+				if logger.ShouldLog(logger.WARN) {
+					logger.Warn(fmt.Sprintf("LAN forward batch for %s failed (kernel-bridge fallback): %v", egressNICs[i].name, lerr))
+				}
+				continue
+			}
+			lanBatch[i] = lb
+			defer lb.Close()
+		}
+		// flushLAN / lanFull operate on the non-primary LAN batches (the primary is
+		// flushed via `batch`). Cheap no-ops when there is only the WAN NIC.
+		flushLAN := func() {
+			for i := range lanBatch {
+				lb := lanBatch[i]
+				if lb == nil || lb == batch || lb.Empty() {
+					continue
+				}
+				if err := lb.Flush(); err != nil && logger.ShouldLog(logger.ERROR) {
+					logger.Error(fmt.Sprintf("LAN forward flush (%s): %v", egressNICs[i].name, err))
+				}
+			}
+		}
+		lanFull := func() bool {
+			for i := range lanBatch {
+				lb := lanBatch[i]
+				if lb == nil || lb == batch {
+					continue
+				}
+				if lb.Full() {
+					return true
+				}
+			}
+			return false
+		}
+
+		// Upload-path inner-TCP-seq resequencer (FORWARD_UPLOAD_RESEQ). connect-ip
 		// carries inner packets over UNORDERED QUIC datagrams, so the forward input is
 		// ~7% reordered (measured: dg_rcvin_ooo). Individual-frame forwarding tolerates
 		// that, but GSO coalescing turns scattered 1-packet reorder into super-frame-
 		// sized gaps that collapse the inner-TCP cwnd. Resequencing by inner TCP seq
-		// BEFORE coalescing restores an in-order stream. Off by default; window/maxAge
-		// tunable via env (no rebuild) to trade added latency vs reorder coverage.
+		// BEFORE coalescing restores an in-order stream.
+		// DEFAULT = ON whenever the forward egress coalesces (tun-GSO/vhost — the
+		// bench-validated pairing); overridable via FORWARD_UPLOAD_RESEQ in the env
+		// (highest precedence, no rebuild) or tmasqued.conf. window/maxAge env-tunable.
+		uploadReseqOn := utility.ForwardCoalesces()
+		if v := os.Getenv("FORWARD_UPLOAD_RESEQ"); v != "" {
+			uploadReseqOn = v == "1" || v == "true"
+		} else if v, ok := ctx.Value("FORWARD_UPLOAD_RESEQ").(string); ok && v != "" {
+			if b, err := strconv.ParseBool(v); err == nil {
+				uploadReseqOn = b
+			}
+		}
 		var uploadReseq *utility.ForwardReseq
-		if v := os.Getenv("FORWARD_UPLOAD_RESEQ"); v == "1" || v == "true" {
+		if uploadReseqOn {
 			win := 64
 			if s := os.Getenv("FORWARD_UPLOAD_RESEQ_WINDOW"); s != "" {
 				if n, e := strconv.Atoi(s); e == nil && n > 0 {
@@ -1044,16 +1418,95 @@ func handleConn(ctx context.Context, tunChan chan *utility.Packet, conn *connect
 		// (upload_postreseq_ooo at /debug/vars) — localizes residual reorder vs the
 		// input (dg_rcvin_ooo) and the target's recv-OFO.
 		uploadObs := utility.NewUploadOrderObserver()
+		// FORWARD_LAN_XDP (default ON) gives the LAN bridge the WAN's fast path: userspace
+		// SNAT to the egress NIC's IP + that NIC's XDP NAT-reverse for the return, instead
+		// of the kernel masquerade/conntrack whose single return path is the LAN's
+		// across-client anti-scaling. =0 restores the transparent kernel bridge (no SNAT)
+		// for A/B and instant rollback without a redeploy. A subnet with no XDP NIC
+		// (docker0, a coexisting VPN) always uses the kernel bridge regardless.
+		lanXDP := ctxBoolDefault(ctx, "FORWARD_LAN_XDP", true)
+		// The AF_XDP-TX and AF_PACKET egresses build the L2 frame in userspace and so need
+		// the destination MAC; the tun-GSO/vhost egress lets the kernel ARP, so skip it.
+		lanEgressNeedsMAC := !utility.ForwardCoalesces()
 
-		// forwardOne routes ONE inner IP packet (already in send order): local-deliver
-		// to tun0 if destined to us, else SNAT + enqueue to the forward egress.
+		// forwardOne is the forward ROUTER for ONE inner IP packet (already in send
+		// order). It is a 4-way decision, not a binary one, so the gateway can bridge
+		// WAN, the VPN overlay, and local LAN(s):
+		//   1) destined to the server itself      → host stack (tun0 write)
+		//   2) another VPN client's vIP            → straight down that peer's tunnel,
+		//      NO SNAT (inner src stays the sender's vIP → the reply rides the peer's
+		//      own tunnel back, never touching the underlay — the only c2c path that
+		//      survives a source-spoofing-checked fabric). Offline peer → drop.
+		//   3) a directly-connected LAN subnet     → forward transparently out that NIC
+		//      via the kernel (ip_forward, NO SNAT) — clients see real LAN hosts.
+		//   4) everything else (WAN / internet)    → SNAT + forward egress.
 		forwardOne := func(ip []byte) {
 			dst, _ := netip.AddrFromSlice(ip[16:20])
 			dst = dst.Unmap()
+			// 1) us
 			if dst == wanAddr || dst == serverTunIP {
 				tunTapDevice[0].Write(ip)
 				return
 			}
+			// 2) another VPN client
+			if virtPrefix.Contains(dst) {
+				mu.RLock()
+				tc := pickTunnel(ipToTunChan[dst], ip)
+				mu.RUnlock()
+				if tc == nil {
+					c2cNoPeer.Add(1) // peer offline; a vIP is unroutable on WAN — drop
+					return
+				}
+				p := utility.PacketPool.Get().(*utility.Packet)
+				p.N = copy(p.Buf, ip)
+				select {
+				case tc <- p:
+					c2cSends.Add(1)
+				default:
+					utility.PacketPool.Put(p)
+					tunChanDrops.Add(1)
+				}
+				return
+			}
+			// 3) local LAN (bridge)
+			for i := range lanRoutes {
+				lr := &lanRoutes[i]
+				if !lr.prefix.Contains(dst) {
+					continue
+				}
+				// Kernel bridge: toggle off, no XDP NIC owns the subnet, or its batch
+				// failed to build → transparent ip_forward + masquerade (the prior path).
+				if !lanXDP || lr.egIdx < 0 || lanBatch[lr.egIdx] == nil {
+					tunTapDevice[0].Write(ip)
+					lanForwards.Add(1)
+					return
+				}
+				eg := &egressNICs[lr.egIdx]
+				// Userspace SNAT to the egress NIC's IP (idempotent per flow → stable
+				// WAN port) so the NIC's XDP NAT-reverse owns the return, off the kernel
+				// conntrack path. Then egress via that NIC's batch.
+				if err := xdp.ApplySNAT(ip, eg.addr, natTable); err != nil {
+					snatFailDrops.Add(1)
+					lanForwards.Add(1)
+					return
+				}
+				var mac net.HardwareAddr
+				if lanEgressNeedsMAC {
+					if mac = eg.conn.LanNextHopMAC(ip[16:20]); mac == nil {
+						// Cold on-link target: the kernel ip_forwards the already-SNAT'd
+						// packet (ARPs + delivers); an async probe primes the fast path.
+						tunTapDevice[0].Write(ip)
+						lanForwards.Add(1)
+						return
+					}
+				}
+				if err := lanBatch[lr.egIdx].Add(ip, mac); err != nil {
+					fwdAddDrops.Add(1)
+				}
+				lanForwards.Add(1)
+				return
+			}
+			// 4) WAN / internet
 			uploadObs.Observe(ip) // post-reseq order, pre-SNAT
 			if err := xdp.ApplySNAT(ip, wanAddr, natTable); err != nil {
 				snatFailDrops.Add(1)
@@ -1080,6 +1533,23 @@ func handleConn(ctx context.Context, tunChan chan *utility.Packet, conn *connect
 			utility.PacketPool.Put(pkt)
 		}
 
+		// FORWARD_WRITER_PIN=1 (experiment): pin this forward-writer goroutine to a
+		// fixed CPU (LockOSThread + sched_setaffinity). The whole kernel forward path
+		// (tun write → ip_forward → NIC TX) runs inline on this goroutine's CPU, and
+		// XPS maps CPU→txq — an unpinned writer migrates, flapping the TX queue,
+		// which on RSS-less virtio flaps the host's mirrored RX steering (spray).
+		// Pinning stabilizes CPU → txq → host steering, and keeps caches warm.
+		if os.Getenv("FORWARD_WRITER_PIN") == "1" {
+			runtime.LockOSThread()
+			cpu := int(writerPinSeq.Add(1)-1) % runtime.NumCPU()
+			var set unix.CPUSet
+			set.Set(cpu)
+			if err := unix.SchedSetaffinity(0, &set); err == nil {
+				if logger.ShouldLog(logger.INFO) {
+					logger.Info(fmt.Sprintf("forward writer pinned to cpu %d", cpu))
+				}
+			}
+		}
 		ticker := time.NewTicker(250 * time.Microsecond)
 		defer ticker.Stop()
 		for {
@@ -1087,14 +1557,19 @@ func handleConn(ctx context.Context, tunChan chan *utility.Packet, conn *connect
 			case pkt, ok := <-pktChan:
 				if !ok {
 					batch.Flush()
+					flushLAN()
 					errChan <- fmt.Errorf("pktChan closed")
 					return
 				}
 				now := time.Now()
+				roundN := 1
 				handlePkt(pkt, now)
-				for len(pktChan) > 0 && !batch.Full() {
+				for len(pktChan) > 0 && !batch.Full() && !lanFull() {
 					handlePkt(<-pktChan, now)
+					roundN++
 				}
+				fwdRounds.Add(1)
+				fwdRoundPkts.Add(int64(roundN))
 				if uploadReseq != nil {
 					reseqOut = uploadReseq.FlushExpired(now, reseqOut[:0])
 					for _, ip := range reseqOut {
@@ -1108,6 +1583,7 @@ func handleConn(ctx context.Context, tunChan chan *utility.Packet, conn *connect
 						}
 					}
 				}
+				flushLAN()
 			case <-ticker.C:
 				if uploadReseq != nil {
 					reseqOut = uploadReseq.FlushExpired(time.Now(), reseqOut[:0])
@@ -1120,6 +1596,7 @@ func handleConn(ctx context.Context, tunChan chan *utility.Packet, conn *connect
 						logger.Error(fmt.Sprintf("sendmmsg error: %v", err))
 					}
 				}
+				flushLAN()
 			}
 		}
 	}()

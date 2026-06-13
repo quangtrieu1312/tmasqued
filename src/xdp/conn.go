@@ -4,6 +4,7 @@ package xdp
 
 import (
 	"encoding/binary"
+	"expvar"
 	"fmt"
 	"net"
 	"net/netip"
@@ -17,6 +18,7 @@ import (
 	"github.com/cilium/ebpf"
 	"golang.org/x/sys/unix"
 
+	"github.com/quangtrieu1312/tmasqued/logger"
 )
 
 // rxPollTimeoutMs is the timeout passed to poll() in the AF_XDP RX loop when the
@@ -51,6 +53,30 @@ var rxBufPool = sync.Pool{
         return &b
     },
 }
+
+// xskRxRounds/xskRxFrames measure RX batch size: frames-per-receive-round
+// (avg = xsk_rx_frames / xsk_rx_rounds). The de-batching diagnosis: under 16
+// queues each ring drains in small rounds; under 1 queue rounds are large.
+var (
+	xskRxRounds = expvar.NewInt("xsk_rx_rounds")
+	xskRxFrames = expvar.NewInt("xsk_rx_frames")
+)
+
+// quicShard is one queue's QUIC frame buffer (single producer, swept by the
+// single ReadFrom consumer). Bounded: full shard drops (counted) like the old
+// channel did.
+type quicShard struct {
+	mu  sync.Mutex
+	buf []quicFrame
+}
+
+const quicShardCap = 1024
+
+// quicRxSweeps/Frames measure consumer batch size (avg = frames/sweeps).
+var (
+	quicRxSweeps = expvar.NewInt("quic_rx_sweeps")
+	quicRxFrames = expvar.NewInt("quic_rx_frames")
+)
 
 // quicFrame is a QUIC/UDP payload delivered to quic-go via ReadFrom.
 type quicFrame struct {
@@ -93,10 +119,26 @@ type Conn struct {
 	neigh   atomic.Pointer[map[netip.Addr]net.HardwareAddr]
 	neighMu sync.Mutex
 
+	// arpPending dedups in-flight async ARP probes for on-link LAN destinations
+	// (LanNextHopMAC). Keyed by netip.Addr; an entry means a probe goroutine is
+	// already resolving that destination, so we don't spawn another per packet.
+	arpPending sync.Map
+
 	txIdx     atomic.Uint64
 	done      chan struct{}
 	mode	XDPMode
-    quicCh chan quicFrame // QUIC/443 frames → ReadFrom
+	// QUIC/443 RX handoff: per-queue SHARDS instead of one shared channel.
+	// One producer (the queue's dispatch goroutine) per shard kills the 16-way
+	// chan-lock contention; the consumer (ReadFrom) sweeps all shards under one
+	// short lock each and serves frames from a local batch — amortizing the
+	// per-frame lock+wakeup that dominated the 16q profile (selectgo/lock2).
+	// Per-flow order: a flow lives on ONE queue → ONE shard (slice = FIFO) →
+	// batch sweep preserves intra-shard order. Cross-shard interleave is
+	// cross-flow and therefore unordered by definition.
+	quicShards []quicShard
+	rxNotify   chan struct{} // 1-buffered edge trigger: a shard went nonempty
+	rxPending  []quicFrame   // consumer-local batch (single ReadFrom caller)
+	rxPendIdx  int
     fwdHandler atomic.Pointer[ForwardHandler] // NAT-return delivery, called inline per dispatch shard
 	quicChDrops atomic.Uint64
 	fwdDrops    atomic.Uint64 // return packets with no matching session
@@ -137,10 +179,26 @@ func NewConn(
 	if err != nil {
 		return nil, fmt.Errorf("resolving next-hop MAC: %w", err)
 	}
+	if gwMAC == nil && logger.ShouldLog(logger.INFO) {
+		// On-link LAN NIC (no gateway): egress MACs are resolved per destination
+		// (LanNextHopMAC) from return traffic / the kernel ARP table.
+		logger.Info(fmt.Sprintf("NIC %s has no gateway fallback (on-link LAN); per-destination next-hop resolution", iface.Name))
+	}
 
 	sockets := make([]*xdp.Socket, numQueues)
 	if mode == XDPModeGeneric {
     	xdp.DefaultSocketFlags = unix.XDP_COPY
+	}
+	// Native mode: always shoot for zero-copy first (virtio supports it on 6.11+,
+	// single-buffer), and fail over to copy mode when the driver rejects the bind.
+	// Forcing the flag (instead of flags=0 auto-negotiation) is deliberate: the
+	// bind result tells us which datapath we actually got, so it can be logged
+	// (auto mode falls back silently). The first queue's outcome decides for all
+	// queues — ZC support is per-driver, not per-queue.
+	zeroCopy := false
+	if mode != XDPModeGeneric {
+		xdp.DefaultSocketFlags = unix.XDP_ZEROCOPY
+		zeroCopy = true
 	}
 	for i := 0; i < numQueues; i++ {
 		opts := &xdp.SocketOptions{
@@ -153,6 +211,18 @@ func NewConn(
     		UseNeedWakeup:          needWakeup,
 		}
 		sock, err := xdp.NewSocket(iface.Index, i, opts)
+		if err != nil && zeroCopy && i == 0 {
+			// driver can't do ZC (e.g. virtio without VIRTIO_F_ACCESS_PLATFORM,
+			// or any virtio on <6.11) → fail over to copy mode. Log the errno —
+			// it says WHY (EINVAL = dma-dev/queue gate, EOPNOTSUPP = no driver
+			// ZC support, EBUSY = queue occupied).
+			if logger.ShouldLog(logger.WARN) {
+				logger.Warn(fmt.Sprintf("AF_XDP zero-copy bind rejected (queue 0), falling back to copy: %v", err))
+			}
+			zeroCopy = false
+			xdp.DefaultSocketFlags = unix.XDP_COPY
+			sock, err = xdp.NewSocket(iface.Index, i, opts)
+		}
 		if err != nil {
 			closeSockets(sockets[:i])
 			return nil, fmt.Errorf("XSK queue %d (XDP mode %s): %w", i, mode, err)
@@ -182,6 +252,14 @@ func NewConn(
 		sockets[i] = sock
 	}
 
+	if logger.ShouldLog(logger.INFO) {
+		bindMode := "copy"
+		if zeroCopy {
+			bindMode = "zero-copy"
+		}
+		logger.Info(fmt.Sprintf("AF_XDP bind: %s", bindMode))
+	}
+
 	c := &Conn{
 		sockets:   sockets,
 		localAddr: frameLocalAddr,
@@ -189,8 +267,9 @@ func NewConn(
 		gwMAC:     gwMAC,
 		ifindex:   iface.Index,
 		done:      make(chan struct{}),
-		mode: mode,
-		quicCh:      make(chan quicFrame, 4096),
+		mode:      mode,
+		quicShards: make([]quicShard, numQueues),
+		rxNotify:   make(chan struct{}, 1),
 	}
 	// One TX pump per socket: the sole owner of that socket's TX + completion
 	// rings. All TX producers (QUIC WriteTo/WriteBatch + the forward path)
@@ -250,6 +329,8 @@ func (c *Conn) dispatchSocket(idx int) {
             }
         }
 
+        xskRxRounds.Add(1)
+        xskRxFrames.Add(int64(numReady))
         descs := sock.Receive(numReady)
         for i := range descs {
             desc := descs[i]
@@ -266,7 +347,7 @@ func (c *Conn) dispatchSocket(idx int) {
                 c.learnNeighbour(netip.AddrFrom4(ip4), frame[6:12])
             }
 
-            c.dispatchFrame(frame, nil, sock, desc)
+            c.dispatchFrame(idx, frame, sock, desc)
         }
     }
 }
@@ -331,7 +412,51 @@ func (c *Conn) NextHopMACForIP(ip []byte) net.HardwareAddr {
     return c.gwMAC
 }
 
-func (c *Conn) dispatchFrame(frame, _ []byte, sock *xdp.Socket, desc xdp.Desc) {
+// LanNextHopMAC resolves the L2 next hop for an on-link LAN destination egressing
+// THIS NIC, for the AF_XDP-TX forward egress (which builds the Ethernet frame in
+// userspace and so needs the destination's MAC — unlike the tun-GSO/kernel egress,
+// which lets the kernel ARP). There is no gateway fallback on a LAN NIC, so:
+//   1. learned neighbour table (primed by this flow's XDP NAT-reverse return) — hot;
+//   2. on miss, the kernel ARP table once (cheap; the kernel keeps on-link entries
+//      warm), caching the hit into neigh so step 1 serves it next time;
+//   3. on a cold miss, a single deduped async ARP probe, returning nil so the caller
+//      bootstraps this packet through the kernel (which ARPs + delivers). Because the
+//      caller has ALREADY applied userspace SNAT, that kernel bootstrap keeps the
+//      same WAN source port as the AF_XDP path — the flow never changes 5-tuple.
+func (c *Conn) LanNextHopMAC(dst []byte) net.HardwareAddr {
+	a, ok := netip.AddrFromSlice(dst)
+	if !ok {
+		return nil
+	}
+	a = a.Unmap()
+	if m := c.neigh.Load(); m != nil {
+		if mac, ok := (*m)[a]; ok {
+			return mac
+		}
+	}
+	ip := a.AsSlice()
+	if mac, err := lookupNeighbourMAC(c.ifindex, ip); err == nil && len(mac) == 6 {
+		c.learnNeighbour(a, mac)
+		return mac
+	}
+	// Cold: probe once (deduped) so a later packet of this flow finds the entry.
+	if _, busy := c.arpPending.LoadOrStore(a, struct{}{}); !busy {
+		go func() {
+			defer c.arpPending.Delete(a)
+			_ = probeARP(ip)
+			for range 5 {
+				time.Sleep(200 * time.Millisecond)
+				if mac, err := lookupNeighbourMAC(c.ifindex, ip); err == nil && len(mac) == 6 {
+					c.learnNeighbour(a, mac)
+					return
+				}
+			}
+		}()
+	}
+	return nil
+}
+
+func (c *Conn) dispatchFrame(idx int, frame []byte, sock *xdp.Socket, desc xdp.Desc) {
     refill := func() {
         sock.Fill([]xdp.Desc{desc})
     }
@@ -357,7 +482,7 @@ func (c *Conn) dispatchFrame(frame, _ []byte, sock *xdp.Socket, desc xdp.Desc) {
             if len(frame) >= udpBase+4 {
                 dstPort := binary.BigEndian.Uint16(frame[udpBase+2 : udpBase+4])
                 if dstPort == 443 {
-                    c.dispatchQUIC(frame, sock, desc, ihl)
+                    c.dispatchQUIC(idx, frame, sock, desc, ihl)
                     return
                 }
             }
@@ -381,8 +506,14 @@ func (c *Conn) TxDrops() uint64     { return c.txDrops.Load() }
 // Ring depths are read without locking — a benign stats-only race, since each
 // RX ring has a single owner goroutine and TX rings are mutated under txMus[i].
 func (c *Conn) DiagSnapshot() string {
-	quicLen := len(c.quicCh)
-	quicCap := cap(c.quicCh)
+	quicLen := 0
+	for i := range c.quicShards {
+		sh := &c.quicShards[i]
+		sh.mu.Lock()
+		quicLen += len(sh.buf)
+		sh.mu.Unlock()
+	}
+	quicCap := quicShardCap * len(c.quicShards)
 
 	// Min free fill ring slots across all sockets (low = RX starvation risk).
 	minFill, minTxFree := 99999, 99999
@@ -415,7 +546,7 @@ func (c *Conn) DiagSnapshot() string {
 	)
 }
 
-func (c *Conn) dispatchQUIC(frame []byte, sock *xdp.Socket, desc xdp.Desc, ihl int) {
+func (c *Conn) dispatchQUIC(idx int, frame []byte, sock *xdp.Socket, desc xdp.Desc, ihl int) {
     // Strip eth(14) + ipv4(ihl) + udp(8). Read everything out of the frame
     // BEFORE refilling, since Fill hands the buffer back to the kernel.
     udpBase := ethHdr + ihl
@@ -436,13 +567,19 @@ func (c *Conn) dispatchQUIC(frame []byte, sock *xdp.Socket, desc xdp.Desc, ihl i
 
     sock.Fill([]xdp.Desc{desc})
 
+    sh := &c.quicShards[idx]
+    sh.mu.Lock()
+    if len(sh.buf) >= quicShardCap {
+        sh.mu.Unlock()
+        rxBufPool.Put(bufp)
+        c.quicChDrops.Add(1)
+        return
+    }
+    sh.buf = append(sh.buf, quicFrame{n: n, addr: &net.UDPAddr{IP: srcIP, Port: int(srcPort)}, data: data, bufp: bufp})
+    sh.mu.Unlock()
     select {
-    	case c.quicCh <- quicFrame{n: n, addr: &net.UDPAddr{IP: srcIP, Port: int(srcPort)}, data: data, bufp: bufp}:
-    	case <-c.done:
-			rxBufPool.Put(bufp)
-		default:
-			rxBufPool.Put(bufp)
-			c.quicChDrops.Add(1)
+    case c.rxNotify <- struct{}{}:
+    default:
     }
 }
 
@@ -475,14 +612,38 @@ func (c *Conn) dispatchFwd(frame []byte, sock *xdp.Socket, desc xdp.Desc) {
 // ReadFrom satisfies net.PacketConn and returns only QUIC/443 payloads
 // to quic-go. It will never see NAT-return tunnel traffic again.
 func (c *Conn) ReadFrom(p []byte) (int, net.Addr, error) {
-	select {
-    case <-c.done:
-        return 0, nil, net.ErrClosed
-    case f := <-c.quicCh:
-        n := copy(p, f.data)
-        rxBufPool.Put(f.bufp) // quic-go copied into p; backing buffer is free now
-        return n, f.addr, nil
-    }
+	for {
+		if c.rxPendIdx < len(c.rxPending) {
+			f := c.rxPending[c.rxPendIdx]
+			c.rxPending[c.rxPendIdx] = quicFrame{} // drop refs for GC
+			c.rxPendIdx++
+			n := copy(p, f.data)
+			rxBufPool.Put(f.bufp) // quic-go copied into p; backing buffer is free now
+			return n, f.addr, nil
+		}
+		// local batch exhausted: sweep every shard once (short lock each).
+		c.rxPending = c.rxPending[:0]
+		c.rxPendIdx = 0
+		for i := range c.quicShards {
+			sh := &c.quicShards[i]
+			sh.mu.Lock()
+			if len(sh.buf) > 0 {
+				c.rxPending = append(c.rxPending, sh.buf...)
+				sh.buf = sh.buf[:0]
+			}
+			sh.mu.Unlock()
+		}
+		if len(c.rxPending) > 0 {
+			quicRxSweeps.Add(1)
+			quicRxFrames.Add(int64(len(c.rxPending)))
+			continue
+		}
+		select {
+		case <-c.done:
+			return 0, nil, net.ErrClosed
+		case <-c.rxNotify:
+		}
+	}
 }
 
 // WriteTo builds a raw Ethernet+IPv4+UDP frame and sends it via AF_XDP.

@@ -27,7 +27,7 @@ var vhostDbgOnce sync.Once
 var forwardViaVhost bool
 
 const (
-	vhostTunName    = "tmvhost0"
+	vhostTunName    = "tmvhost0" // "tm" prefix so buildLocalLANs + the tm+ iptables cover it
 	tunSetVnetHdrSz = 0x400454d8 // TUNSETVNETHDRSZ = _IOW('T', 216, int)
 )
 

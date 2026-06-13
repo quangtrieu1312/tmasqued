@@ -37,12 +37,18 @@ var forwardViaPacket = os.Getenv("FORWARD_KERNEL_TX") == "1"
 
 // SetForwardMode selects the upload-forward egress from config (FORWARD_TUN_GSO /
 // FORWARD_TUN_VHOST in tmasqued.conf), replacing the old env-var package init. Must be
-// called once at startup BEFORE any NewForwardBatch. Both default false → the default
-// AF_XDP-TX forward egress (today's behavior).
+// called once at startup BEFORE any NewForwardBatch. The caller defaults GSO to true
+// when vhost is not selected (tun-GSO is the shipped default forward path).
 func SetForwardMode(gso, vhost bool) {
     forwardViaTun = gso
     forwardViaVhost = vhost
 }
+
+// ForwardCoalesces reports whether the selected upload-forward egress coalesces
+// packets into super-frames (tun-GSO or vhost) — the modes that need the upload
+// resequencer (coalescing turns scattered 1-packet reorder into super-frame-sized
+// gaps that collapse the inner-TCP cwnd).
+func ForwardCoalesces() bool { return forwardViaTun || forwardViaVhost }
 
 // fwdEgress is the common shape of the alternative (kernel-TX) forward egress.
 type fwdEgress interface {

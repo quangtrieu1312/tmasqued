@@ -15,9 +15,14 @@ SAN_IP_LIST=1.1.1.1,8.8.4.4,8.8.8.8
 ENABLE_STATISTIC=false
 # LOG_PACKET=true dumps every packet's payload (extremely verbose; debugging only).
 LOG_PACKET=false
-# Upload-forward egress (both default false = AF_XDP-TX kernel-bypass). Mutually exclusive.
-# FORWARD_TUN_GSO=true coalesces upload TCP into TSO super-frames written to the main tun
-#   (opened IFF_VNET_HDR) so the kernel host-TSO-segments + ip_forwards them.
-# FORWARD_TUN_VHOST=true forwards via a vhost-net-fronted TAP (kernel GRO) instead.
-FORWARD_TUN_GSO=false
-FORWARD_TUN_VHOST=false
+# Upload-forward egress. Mutually exclusive; DEFAULT = tun-GSO (best aggregate across all
+# measured NIC regimes; ~2-4x AF_XDP-TX on single-queue NICs, equal under full RSS).
+# FORWARD_TUN_GSO=true (default) coalesces upload TCP into TSO super-frames written to the
+#   main tun (opened IFF_VNET_HDR) so the kernel host-TSO-segments + ip_forwards them.
+#   Set FORWARD_TUN_GSO=false explicitly for the raw AF_XDP-TX egress.
+# FORWARD_TUN_VHOST=true forwards via a vhost-net-fronted TAP (kernel GRO) instead
+#   (disables the GSO default automatically).
+# The upload resequencer (FORWARD_UPLOAD_RESEQ) defaults ON whenever a coalescing
+# egress (GSO/vhost) is active; override here or via env.
+#FORWARD_TUN_GSO=true
+#FORWARD_TUN_VHOST=false

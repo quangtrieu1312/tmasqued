@@ -10,12 +10,23 @@ import (
 	"github.com/vishvananda/netlink"
 )
 
-// resolveNextHopMAC finds the MAC address of the next hop for outbound packets.
-// If the ARP entry is stale or missing it probes the gateway and retries.
+// resolveNextHopMAC finds the MAC address of the next hop for outbound packets
+// egressing iface. If the ARP entry is stale or missing it probes the gateway and
+// retries.
+//
+// A NIC with no gateway reachable through it (a directly-connected LAN — e.g. the
+// secondary NIC a multi-NIC gateway bridges its clients onto) has NO single
+// next-hop fallback: every on-link destination's MAC is resolved per-packet (from
+// return traffic / the kernel ARP table). For such a NIC this returns (nil, nil) —
+// the caller keeps gwMAC == nil and the LAN egress resolves per destination. This
+// is deliberately NOT an error, so the datapath comes up on every real NIC.
 func resolveNextHopMAC(iface *net.Interface, localIP net.IP) (net.HardwareAddr, error) {
-	gwIP, err := defaultGatewayIP()
+	gwIP, err := gatewayIPForIface(iface.Index)
 	if err != nil {
-		return nil, fmt.Errorf("finding default gateway: %w", err)
+		return nil, fmt.Errorf("finding gateway for %s: %w", iface.Name, err)
+	}
+	if gwIP == nil {
+		return nil, nil // on-link LAN NIC: no gateway fallback (per-destination resolution)
 	}
 
 	// Fast path: already in the neighbour cache.
@@ -50,26 +61,32 @@ func probeARP(ip net.IP) error {
 	return nil
 }
 
-// defaultGatewayIP returns the IPv4 address of the default route gateway.
-func defaultGatewayIP() (net.IP, error) {
+// gatewayIPForIface returns the IPv4 gateway of the default route that egresses
+// the given interface, or (nil, nil) if no default route uses this NIC (a
+// directly-connected LAN with on-link delivery only). A netlink failure is a real
+// error; the absence of a gateway is not.
+func gatewayIPForIface(ifaceIndex int) (net.IP, error) {
 	routes, err := netlink.RouteList(nil, netlink.FAMILY_V4)
 	if err != nil {
 		return nil, fmt.Errorf("listing routes: %w", err)
 	}
 	for _, r := range routes {
 		if r.Gw == nil {
-            continue
-        }
-        // default route can be nil Dst OR 0.0.0.0/0
-        if r.Dst == nil {
-            return r.Gw, nil
-        }
-        ones, bits := r.Dst.Mask.Size()
-        if ones == 0 && bits == 32 {
-            return r.Gw, nil
-        }
+			continue
+		}
+		if r.LinkIndex != ifaceIndex {
+			continue // a gateway reachable via a DIFFERENT NIC is not our next hop
+		}
+		// default route can be nil Dst OR 0.0.0.0/0
+		if r.Dst == nil {
+			return r.Gw, nil
+		}
+		ones, bits := r.Dst.Mask.Size()
+		if ones == 0 && bits == 32 {
+			return r.Gw, nil
+		}
 	}
-	return nil, fmt.Errorf("no default IPv4 route found")
+	return nil, nil // no default route via this NIC — on-link LAN
 }
 
 // lookupNeighbourMAC looks up the MAC for ip in the kernel neighbour (ARP) table.

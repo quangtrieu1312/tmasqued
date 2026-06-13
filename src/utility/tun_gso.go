@@ -49,13 +49,38 @@ var tunMaxSegs = func() int {
 
 var tunNoCoalesce = os.Getenv("FORWARD_TUN_NOCOALESCE") == "1"
 
-const flushIdle = 120 * time.Microsecond
+// flushIdle: an open super-frame untouched this long is finalized (the latency
+// bound on coalescing). Env-tunable for experiments: FORWARD_TUN_GSO_FLUSH_IDLE_US.
+var flushIdle = func() time.Duration {
+	if s := os.Getenv("FORWARD_TUN_GSO_FLUSH_IDLE_US"); s != "" {
+		if n, e := strconv.Atoi(s); e == nil && n > 0 {
+			return time.Duration(n) * time.Microsecond
+		}
+	}
+	return 120 * time.Microsecond
+}()
 
 var (
 	tunGsoWrites = expvar.NewInt("tun_gso_writes")
 	tunGsoCoal   = expvar.NewInt("tun_gso_coalesced")
 	tunGsoDrops  = expvar.NewInt("tun_gso_drops")
+	// Close-reason counters (why a super-frame was finalized). With per-flow slots
+	// a different flow's packet no longer closes anything, so the old dominant
+	// reason ("flow switch") is gone by design; what remains tells us the next
+	// bottleneck: gap = in-flow seq mismatch (retransmit/reorder), full = segment/
+	// size cap reached, idle = flushIdle sweep, evict = slot-cap LRU eviction.
+	tunGsoCloseGap   = expvar.NewInt("tun_gso_close_gap")
+	tunGsoCloseFull  = expvar.NewInt("tun_gso_close_full")
+	tunGsoCloseIdle  = expvar.NewInt("tun_gso_close_idle")
+	tunGsoCloseEvict = expvar.NewInt("tun_gso_close_evict")
 )
+
+// tunMaxFlowSlots caps the per-batch (= per-connection) number of concurrently
+// open super-frames. One slot per active inner TCP flow; a typical bench client
+// runs -P12, so 32 covers it with room. At the cap, the least-recently-grown
+// slot is flushed and reused (counted in tun_gso_close_evict). Each slot owns a
+// ~64 KB build buffer, allocated lazily on first use and kept on a freelist.
+const tunMaxFlowSlots = 32
 
 type tcpView struct {
 	ihl, thl   int
@@ -120,28 +145,82 @@ func tcpPseudoSeedV4(srcIP, dstIP []byte, tcpLen uint16) uint16 {
 	return fold16(ac)
 }
 
-type TunGSOBatch struct {
-	fd       int
+// gsoSlot is one in-progress super-frame for one inner TCP flow. With one slot
+// per flow, a packet from flow B no longer forces flow A's frame closed (the old
+// single-open-frame design's dominant close reason — measured 7.4 segs/frame
+// under rss vs 12.7 under none purely from interleave-driven early closes).
+type gsoSlot struct {
 	buf      []byte // [vnet(10) | ip | tcp | payload...]
 	aoff     int
-	openSegs int
-	openIHL  int
-	openTHL  int
-	openSeg  int // payload bytes per segment (gso_size)
-	openNext uint32
-	openKey  [12]byte
+	segs     int
+	ihl      int
+	thl      int
+	segSize  int // payload bytes per segment (gso_size)
+	nextSeq  uint32
 	lastGrow time.Time
+}
+
+type TunGSOBatch struct {
+	fd      int
+	slots   map[[12]byte]*gsoSlot // open frame per flow (only entries with segs>0)
+	free    []*gsoSlot            // buffer freelist (slots are ~64 KB each)
+	open    int                   // number of slots with segs>0
+	scratch []byte                // writeNonGSO staging
 }
 
 // NewTunGSOBatch builds a coalescing writer over an EXISTING IFF_VNET_HDR tun fd
 // (the main water tun's GSOFd). It writes TSO super-frames straight to that fd and
 // the kernel segments + ip_forwards them — no dedicated tmfwd0 device is created.
 // tunFd<0 means the main tun was not opened with GSO, which is a config/wiring bug.
+// NOT goroutine-safe: one instance per connection goroutine (ordering within a
+// flow is a writer-thread property — a flow must never span two instances).
 func NewTunGSOBatch(tunFd int) (*TunGSOBatch, error) {
 	if tunFd < 0 {
 		return nil, fmt.Errorf("FORWARD_TUN_GSO set but main tun was not opened with GSO (IFF_VNET_HDR); GSOFd=-1")
 	}
-	return &TunGSOBatch{fd: tunFd, buf: make([]byte, vnetHdrLen+gsoMaxL3+128)}, nil
+	return &TunGSOBatch{
+		fd:      tunFd,
+		slots:   make(map[[12]byte]*gsoSlot, tunMaxFlowSlots),
+		scratch: make([]byte, vnetHdrLen+gsoMaxL3+128),
+	}, nil
+}
+
+func (b *TunGSOBatch) getSlot(key [12]byte) *gsoSlot {
+	if s := b.slots[key]; s != nil {
+		return s
+	}
+	if len(b.slots) >= tunMaxFlowSlots {
+		b.evictOldest()
+	}
+	var s *gsoSlot
+	if n := len(b.free); n > 0 {
+		s = b.free[n-1]
+		b.free = b.free[:n-1]
+	} else {
+		s = &gsoSlot{buf: make([]byte, vnetHdrLen+gsoMaxL3+128)}
+	}
+	b.slots[key] = s
+	return s
+}
+
+// evictOldest flushes + removes the least-recently-grown slot (slot cap reached).
+func (b *TunGSOBatch) evictOldest() {
+	var oldKey [12]byte
+	var old *gsoSlot
+	for k, s := range b.slots {
+		if old == nil || s.lastGrow.Before(old.lastGrow) {
+			oldKey, old = k, s
+		}
+	}
+	if old == nil {
+		return
+	}
+	if old.segs > 0 {
+		tunGsoCloseEvict.Add(1)
+		b.flushSlot(old)
+	}
+	delete(b.slots, oldKey)
+	b.free = append(b.free, old)
 }
 
 func (b *TunGSOBatch) Add(pkt []byte, _ net.HardwareAddr) error {
@@ -149,61 +228,67 @@ func (b *TunGSOBatch) Add(pkt []byte, _ net.HardwareAddr) error {
 		return b.writeNonGSO(pkt)
 	}
 	v, ok := parseV4TCP(pkt)
-	if ok && b.openSegs > 0 &&
-		v.key == b.openKey &&
-		v.seq == b.openNext &&
-		v.ihl == b.openIHL && v.thl == b.openTHL &&
-		v.payloadLen <= b.openSeg &&
-		b.openSegs < tunMaxSegs &&
-		(b.aoff-vnetHdrLen)+v.payloadLen <= gsoMaxL3 &&
-		tcpOptsEqual(pkt, v, b.buf[vnetHdrLen:], b.openIHL, b.openTHL) {
-		copy(b.buf[b.aoff:], pkt[v.payloadOff:v.payloadOff+v.payloadLen])
-		b.aoff += v.payloadLen
-		b.openSegs++
-		b.openNext += uint32(v.payloadLen)
-		b.lastGrow = time.Now()
+	if !ok {
+		return b.writeNonGSO(pkt)
+	}
+	s := b.getSlot(v.key)
+	if s.segs > 0 &&
+		v.seq == s.nextSeq &&
+		v.ihl == s.ihl && v.thl == s.thl &&
+		v.payloadLen <= s.segSize &&
+		s.segs < tunMaxSegs &&
+		(s.aoff-vnetHdrLen)+v.payloadLen <= gsoMaxL3 &&
+		tcpOptsEqual(pkt, v, s.buf[vnetHdrLen:], s.ihl, s.thl) {
+		copy(s.buf[s.aoff:], pkt[v.payloadOff:v.payloadOff+v.payloadLen])
+		s.aoff += v.payloadLen
+		s.segs++
+		s.nextSeq += uint32(v.payloadLen)
+		s.lastGrow = time.Now()
 		tunGsoCoal.Add(1)
-		if v.payloadLen < b.openSeg || b.openSegs >= tunMaxSegs ||
-			(b.aoff-vnetHdrLen)+b.openSeg > gsoMaxL3 {
-			b.flushOpen()
+		if v.payloadLen < s.segSize || s.segs >= tunMaxSegs ||
+			(s.aoff-vnetHdrLen)+s.segSize > gsoMaxL3 {
+			tunGsoCloseFull.Add(1)
+			b.flushSlot(s)
 		}
 		return nil
 	}
-
-	b.flushOpen()
-	if ok {
-		b.aoff = vnetHdrLen
-		b.aoff += copy(b.buf[b.aoff:], pkt)
-		b.openSegs = 1
-		b.openIHL = v.ihl
-		b.openTHL = v.thl
-		b.openSeg = v.payloadLen
-		b.openNext = v.seq + uint32(v.payloadLen)
-		b.openKey = v.key
-		b.lastGrow = time.Now()
-		return nil
+	if s.segs > 0 {
+		// same flow, but seq gap / header change / size misfit: close and restart.
+		tunGsoCloseGap.Add(1)
+		b.flushSlot(s)
 	}
-	return b.writeNonGSO(pkt)
+	s.aoff = vnetHdrLen
+	s.aoff += copy(s.buf[s.aoff:], pkt)
+	s.segs = 1
+	s.ihl = v.ihl
+	s.thl = v.thl
+	s.segSize = v.payloadLen
+	s.nextSeq = v.seq + uint32(v.payloadLen)
+	s.lastGrow = time.Now()
+	b.open++
+	return nil
 }
 
-// flushOpen finalizes the open super-frame and writes it.
-func (b *TunGSOBatch) flushOpen() {
-	if b.openSegs == 0 {
+// flushSlot finalizes a slot's super-frame and writes it. The slot stays in the
+// map (flow likely continues); empty slots are reaped by the Flush sweep.
+func (b *TunGSOBatch) flushSlot(s *gsoSlot) {
+	if s.segs == 0 {
 		return
 	}
-	ip := b.buf[vnetHdrLen:b.aoff]
-	if b.openSegs == 1 {
+	ip := s.buf[vnetHdrLen:s.aoff]
+	if s.segs == 1 {
 		// single packet: already-valid SNAT'd checksum; emit GSO_NONE, no offload.
 		for i := 0; i < vnetHdrLen; i++ {
-			b.buf[i] = 0
+			s.buf[i] = 0
 		}
-		b.writeFrame(b.buf[:b.aoff])
-		b.openSegs = 0
-		b.aoff = 0
+		b.writeFrame(s.buf[:s.aoff])
+		s.segs = 0
+		s.aoff = 0
+		b.open--
 		return
 	}
-	ihl := b.openIHL
-	l3 := b.aoff - vnetHdrLen
+	ihl := s.ihl
+	l3 := s.aoff - vnetHdrLen
 	// IP total length + checksum
 	binary.BigEndian.PutUint16(ip[2:4], uint16(l3))
 	ip[10], ip[11] = 0, 0
@@ -214,29 +299,30 @@ func (b *TunGSOBatch) flushOpen() {
 	seed := tcpPseudoSeedV4(ip[12:16], ip[16:20], tcpLen)
 	binary.BigEndian.PutUint16(tcp[16:18], seed)
 	// virtio_net_hdr
-	v := b.buf[:vnetHdrLen]
+	v := s.buf[:vnetHdrLen]
 	v[0] = vFNeedsCsum
 	v[1] = vGSOTcpv4
-	binary.LittleEndian.PutUint16(v[2:4], uint16(ihl+b.openTHL)) // hdr_len
-	binary.LittleEndian.PutUint16(v[4:6], uint16(b.openSeg))     // gso_size
-	binary.LittleEndian.PutUint16(v[6:8], uint16(ihl))           // csum_start (L3 TUN: IP header len)
-	binary.LittleEndian.PutUint16(v[8:10], 16)                   // csum_offset (TCP checksum)
-	b.writeFrame(b.buf[:b.aoff])
-	b.openSegs = 0
-	b.aoff = 0
+	binary.LittleEndian.PutUint16(v[2:4], uint16(ihl+s.thl))   // hdr_len
+	binary.LittleEndian.PutUint16(v[4:6], uint16(s.segSize))   // gso_size
+	binary.LittleEndian.PutUint16(v[6:8], uint16(ihl))         // csum_start (L3 TUN: IP header len)
+	binary.LittleEndian.PutUint16(v[8:10], 16)                 // csum_offset (TCP checksum)
+	b.writeFrame(s.buf[:s.aoff])
+	s.segs = 0
+	s.aoff = 0
+	b.open--
 }
 
 // writeNonGSO writes a single packet with a GSO_NONE virtio_net_hdr (pass-through).
 func (b *TunGSOBatch) writeNonGSO(pkt []byte) error {
-	if vnetHdrLen+len(pkt) > len(b.buf) {
+	if vnetHdrLen+len(pkt) > len(b.scratch) {
 		tunGsoDrops.Add(1)
 		return nil
 	}
 	for i := 0; i < vnetHdrLen; i++ {
-		b.buf[i] = 0
+		b.scratch[i] = 0
 	}
-	n := copy(b.buf[vnetHdrLen:], pkt)
-	return b.writeFrame(b.buf[:vnetHdrLen+n])
+	n := copy(b.scratch[vnetHdrLen:], pkt)
+	return b.writeFrame(b.scratch[:vnetHdrLen+n])
 }
 
 func (b *TunGSOBatch) writeFrame(frame []byte) error {
@@ -248,16 +334,36 @@ func (b *TunGSOBatch) writeFrame(frame []byte) error {
 	return nil
 }
 
-// Flush finalizes the open super-frame if it has gone idle.
+// slotReapIdle: an empty slot untouched this long is removed and its buffer
+// returned to the freelist (flow finished). Generous vs flushIdle so a live
+// flow's slot isn't churned.
+const slotReapIdle = 10 * time.Millisecond
+
+// Flush sweeps all slots: finalizes frames idle >= flushIdle (the latency bound)
+// and reaps long-empty slots. Called by the drain loop on batch boundaries and
+// from its 250 µs ticker, so the sweep cadence is bounded even with no traffic.
 func (b *TunGSOBatch) Flush(_ bool) error {
-	if b.openSegs > 0 && time.Since(b.lastGrow) >= flushIdle {
-		b.flushOpen()
+	now := time.Now()
+	for k, s := range b.slots {
+		if s.segs > 0 {
+			if now.Sub(s.lastGrow) >= flushIdle {
+				tunGsoCloseIdle.Add(1)
+				b.flushSlot(s)
+			}
+		} else if now.Sub(s.lastGrow) >= slotReapIdle {
+			delete(b.slots, k)
+			b.free = append(b.free, s)
+		}
 	}
 	return nil
 }
 func (b *TunGSOBatch) Full() bool  { return false }
-func (b *TunGSOBatch) Empty() bool { return b.openSegs == 0 }
-func (b *TunGSOBatch) Close()      {}
+func (b *TunGSOBatch) Empty() bool { return b.open == 0 }
+func (b *TunGSOBatch) Close() {
+	for _, s := range b.slots {
+		b.flushSlot(s)
+	}
+}
 
 // tcpOptsEqual reports whether pkt's TCP options match the open frame's (so the replicated
 // header is valid for every coalesced segment — TSval etc. must be identical).

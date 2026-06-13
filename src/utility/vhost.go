@@ -4,6 +4,7 @@ package utility
 
 import (
 	"fmt"
+	"sync"
 	"sync/atomic"
 	"unsafe"
 
@@ -99,6 +100,11 @@ type vhostNetWriter struct {
 	availIdx uint16 // our running avail index (mod 2^16)
 	lastUsed uint16 // our running used index for reclaim
 	freeHead uint32 // next descriptor to (re)use, round-robin
+
+	// One vhostNetWriter is shared (singleton) across all per-connection forward
+	// goroutines, so the vring mutations below must be serialized — otherwise
+	// concurrent Submit/Flush calls tear availIdx/freeHead and corrupt the avail ring.
+	mu sync.Mutex
 }
 
 func (w *vhostNetWriter) availIdxPtr() *uint16 {
@@ -259,7 +265,9 @@ func fence() { atomic.AddUint32(&vhostFence, 1) }
 var vhostDbgN int
 
 func (w *vhostNetWriter) Submit(pkt []byte) bool {
-	w.Reclaim()
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	w.Reclaim() // safe under lock: Reclaim is only ever called from here
 	if w.availIdx-w.lastUsed >= uint16(w.n) {
 		if vhostDbgN < 8 {
 			vhostDbgN++
@@ -290,6 +298,8 @@ func (w *vhostNetWriter) Submit(pkt []byte) bool {
 
 // Flush publishes the accumulated avail index to the worker and kicks it.
 func (w *vhostNetWriter) Flush() {
+	w.mu.Lock()
+	defer w.mu.Unlock()
 	fence() // descriptor + ring writes before the idx publish
 	*w.availIdxPtr() = w.availIdx
 	fence()
