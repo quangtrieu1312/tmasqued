@@ -242,6 +242,30 @@ func main() {
 	// behavior, no fragmentation), a jumbo-capable underlay -> up to ~3426 / ~3478.
 	// An explicit TUNNEL_MTU (>0) overrides the auto value.
 	effWanMTU := link.Attrs().MTU
+	// LAN-bridge safety: the inner tun MTU is a single value, but a forwarded packet
+	// may egress out a *different* (LAN) NIC than the WAN. If that NIC's MTU is smaller,
+	// a WAN-sized bridged packet won't fit (drop/fragment). So clamp to the SMALLEST
+	// real, UP egress NIC the datapath can use. (bootstrap/004 caps every real NIC to
+	// <=3506 for XDP-native but never raises a smaller one, e.g. a 1500 LAN NIC.)
+	if links, lerr := netlink.LinkList(); lerr == nil {
+		minEgress, clampNIC := effWanMTU, ""
+		for _, l := range links {
+			n := l.Attrs().Name
+			if n == ifaceName || n == "lo" || strings.HasPrefix(n, "tm") {
+				continue
+			}
+			if l.Attrs().Flags&net.FlagUp == 0 || !xdp.IsRealNIC(n) {
+				continue
+			}
+			if m := l.Attrs().MTU; m > 0 && m < minEgress {
+				minEgress, clampNIC = m, n
+			}
+		}
+		if minEgress < effWanMTU {
+			logger.Warn(fmt.Sprintf("inner MTU clamped from WAN %d to %d (egress NIC %s) so LAN-bridge traffic fits", effWanMTU, minEgress, clampNIC))
+			effWanMTU = minEgress
+		}
+	}
 	if effWanMTU > xdpNativeMaxMTU {
 		effWanMTU = xdpNativeMaxMTU
 	}
