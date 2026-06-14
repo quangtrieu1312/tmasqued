@@ -130,11 +130,16 @@ func NewForwardBatch(
 // the packet's destination; it is used by the XDP and AF_PACKET paths.
 func (b *ForwardBatch) Add(pkt []byte, dstMAC net.HardwareAddr) error {
     if isXDPEligible(pkt) {
-        if b.alt != nil {
-            return b.alt.Add(pkt, dstMAC) // kernel TX (batched sendmmsg), like WG
-        }
+        // Sparse small TCP (pure ACKs, <128B) ALWAYS go via the kernel raw socket for
+        // clean qdisc pacing — even when a coalescing/alt egress (GSO/vhost/uring/napi/
+        // kernel-TX) is active. Checking this BEFORE b.alt is what lets the download
+        // ACK-clock fix compose with the gso forward default (else gso buffers the ACKs
+        // in the GSO tun and the download collapses).
         if forwardAckViaSocket && len(pkt) < 128 {
             return b.sock.Add(pkt) // route small TCP (ACKs) via kernel raw socket
+        }
+        if b.alt != nil {
+            return b.alt.Add(pkt, dstMAC) // kernel TX (batched sendmmsg), like WG
         }
         return b.xdp.Add(pkt, dstMAC)
     }
