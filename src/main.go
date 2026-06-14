@@ -236,61 +236,74 @@ func main() {
 	if err != nil {
 		logger.Fatal(fmt.Sprintf("failed to get %s interface: %v", ifaceName, err))
 	}
-	// Adaptive MTU: derive the tunnel inner MTU + the QUIC outer packet size from
-	// the WAN link MTU (capped to the XDP-native virtio limit) instead of hardcoding
-	// a jumbo value. So a 1500/1G underlay -> ~1420 inner / ~1472 outer (old safe
-	// behavior, no fragmentation), a jumbo-capable underlay -> up to ~3426 / ~3478.
-	// An explicit TUNNEL_MTU (>0) overrides the auto value.
-	effWanMTU := link.Attrs().MTU
-	// LAN-bridge safety: the inner tun MTU is a single value, but a forwarded packet
-	// may egress out a *different* (LAN) NIC than the WAN. If that NIC's MTU is smaller,
-	// a WAN-sized bridged packet won't fit (drop/fragment). So clamp to the SMALLEST
-	// real, UP egress NIC the datapath can use. (bootstrap/004 caps every real NIC to
-	// <=3506 for XDP-native but never raises a smaller one, e.g. a 1500 LAN NIC.)
-	if links, lerr := netlink.LinkList(); lerr == nil {
-		minEgress, clampNIC := effWanMTU, ""
-		for _, l := range links {
-			n := l.Attrs().Name
-			if n == ifaceName || n == "lo" || strings.HasPrefix(n, "tm") {
-				continue
-			}
-			if l.Attrs().Flags&net.FlagUp == 0 || !xdp.IsRealNIC(n) {
-				continue
-			}
-			if m := l.Attrs().MTU; m > 0 && m < minEgress {
-				minEgress, clampNIC = m, n
-			}
-		}
-		if minEgress < effWanMTU {
-			logger.Warn(fmt.Sprintf("inner MTU clamped from WAN %d to %d (egress NIC %s) so LAN-bridge traffic fits", effWanMTU, minEgress, clampNIC))
-			effWanMTU = minEgress
-		}
-	}
-	if effWanMTU > xdpNativeMaxMTU {
-		effWanMTU = xdpNativeMaxMTU
-	}
-	serverInitialPacketSize = effWanMTU - outerOverhead // safely under the WAN MTU
-	if serverInitialPacketSize > maxQUICPacket {
-		serverInitialPacketSize = maxQUICPacket
-	}
-	if serverInitialPacketSize < 1252 {
-		serverInitialPacketSize = 1252
-	}
+	// Tunnel inner MTU + QUIC outer packet size. An explicit TUNNEL_MTU in the config
+	// FULLY overrides the auto-detect (and the egress clamp below): the operator's inner
+	// MTU then also drives the QUIC outer packet size, so a pinned MTU is honored end to
+	// end. Otherwise derive from the WAN link MTU (capped to the XDP-native virtio limit,
+	// then clamped to the smallest egress NIC) instead of hardcoding a jumbo value — a
+	// 1500/1G underlay -> ~1420 inner, a jumbo-capable one -> up to ~3426.
 	var mtu uint64
 	if v, ok := ctx.Value("TUNNEL_MTU").(string); ok {
 		if m, e := strconv.ParseUint(v, 10, 64); e == nil {
 			mtu = m
 		}
 	}
-	if mtu == 0 { // auto: inner fits one DATAGRAM in the outer QUIC packet
+	if mtu > 0 {
+		// config override: size the QUIC outer to carry one DATAGRAM of the pinned inner.
+		serverInitialPacketSize = int(mtu) + datagramOverhead
+		if serverInitialPacketSize > maxQUICPacket {
+			serverInitialPacketSize = maxQUICPacket
+		}
+		if serverInitialPacketSize < 1252 {
+			serverInitialPacketSize = 1252
+		}
+		if logger.ShouldLog(logger.INFO) {
+			logger.Info(fmt.Sprintf("MTU: TUNNEL_MTU=%d (config override) -> inner=%d, QUIC InitialPacketSize=%d", mtu, mtu, serverInitialPacketSize))
+		}
+	} else {
+		effWanMTU := link.Attrs().MTU
+		// LAN-bridge safety: the inner tun MTU is a single value, but a forwarded packet
+		// may egress out a *different* (LAN) NIC than the WAN. If that NIC's MTU is smaller,
+		// a WAN-sized bridged packet won't fit (drop/fragment). So clamp to the SMALLEST
+		// real, UP egress NIC the datapath can use. (bootstrap/004 caps every virtio NIC to
+		// <=3506 for XDP-native but never raises a smaller one, e.g. a 1500 LAN NIC.)
+		if links, lerr := netlink.LinkList(); lerr == nil {
+			minEgress, clampNIC := effWanMTU, ""
+			for _, l := range links {
+				n := l.Attrs().Name
+				if n == ifaceName || n == "lo" || strings.HasPrefix(n, "tm") {
+					continue
+				}
+				if l.Attrs().Flags&net.FlagUp == 0 || !xdp.IsRealNIC(n) {
+					continue
+				}
+				if m := l.Attrs().MTU; m > 0 && m < minEgress {
+					minEgress, clampNIC = m, n
+				}
+			}
+			if minEgress < effWanMTU {
+				logger.Warn(fmt.Sprintf("inner MTU clamped from WAN %d to %d (egress NIC %s) so LAN-bridge traffic fits", effWanMTU, minEgress, clampNIC))
+				effWanMTU = minEgress
+			}
+		}
+		if effWanMTU > xdpNativeMaxMTU {
+			effWanMTU = xdpNativeMaxMTU
+		}
+		serverInitialPacketSize = effWanMTU - outerOverhead // safely under the WAN MTU
+		if serverInitialPacketSize > maxQUICPacket {
+			serverInitialPacketSize = maxQUICPacket
+		}
+		if serverInitialPacketSize < 1252 {
+			serverInitialPacketSize = 1252
+		}
 		inner := serverInitialPacketSize - datagramOverhead
 		if inner < 576 {
 			inner = 576
 		}
 		mtu = uint64(inner)
-	}
-	if logger.ShouldLog(logger.INFO) {
-		logger.Info(fmt.Sprintf("MTU: WAN(eff)=%d -> inner=%d, QUIC InitialPacketSize=%d", effWanMTU, mtu, serverInitialPacketSize))
+		if logger.ShouldLog(logger.INFO) {
+			logger.Info(fmt.Sprintf("MTU: WAN(eff)=%d -> inner=%d, QUIC InitialPacketSize=%d", effWanMTU, mtu, serverInitialPacketSize))
+		}
 	}
 	// assuming we are only doing IPv4
 	family := netlink.FAMILY_V4

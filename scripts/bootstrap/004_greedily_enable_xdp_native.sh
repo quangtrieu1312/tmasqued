@@ -38,6 +38,14 @@ pin_nic() {
     fi
     ethtool -K "$nic" gro off lro off 2>/dev/null
 
+    # The page-size / 3506 MTU cap is a virtio_net XDP-native limitation (virtio_net
+    # rejects XDP-native attach above 3506). Only scale DOWN virtio_net NICs; other
+    # drivers may run XDP-native at a larger MTU, so don't needlessly cripple them.
+    # (gro/lro above are disabled for EVERY real NIC — that's for csum correctness.)
+    local drv
+    drv=$(ethtool -i "$nic" 2>/dev/null | awk -F': ' '/^driver:/{print $2}')
+    [ "$drv" = "virtio_net" ] || return
+
     local nicMTU
     nicMTU=$(cat /sys/class/net/$nic/mtu 2>/dev/null)
     [ -n "$nicMTU" ] || return
