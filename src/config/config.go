@@ -4,6 +4,7 @@ import (
     "context"
 	"bufio"
 	"log"
+    "strconv"
     "strings"
 	"os"
 
@@ -35,4 +36,27 @@ func Load(ctx *context.Context) {
         }
         *ctx = context.WithValue(*ctx, key, value)
     }
+}
+
+// Bool reads a config key from the context as a boolean, returning def when the key
+// is absent/empty or unparseable. Accepts the strconv.ParseBool forms (1/t/true,
+// 0/f/false, ...).
+func Bool(ctx context.Context, key string, def bool) bool {
+	if v, ok := ctx.Value(key).(string); ok && v != "" {
+		if b, err := strconv.ParseBool(v); err == nil {
+			return b
+		}
+	}
+	return def
+}
+
+// Int reads a config key from the context as an int, returning def when the key is
+// absent/empty or unparseable.
+func Int(ctx context.Context, key string, def int) int {
+	if v, ok := ctx.Value(key).(string); ok && v != "" {
+		if n, err := strconv.Atoi(v); err == nil {
+			return n
+		}
+	}
+	return def
 }

@@ -26,3 +26,43 @@ LOG_PACKET=false
 # egress (GSO/vhost) is active; override here or via env.
 #FORWARD_TUN_GSO=true
 #FORWARD_TUN_VHOST=false
+
+# --- Advanced datapath tuning (all optional; defaults shown; restart to change) ---
+# Pin the forward-writer goroutine to a fixed CPU (LockOSThread + sched_setaffinity).
+# Aimed at RSS-less virtio (stabilizes CPU->txq->host RX steering). A/B measured it
+# neutral at RSS and inconclusive under single-queue, so DEFAULT OFF. Set true to try.
+#FORWARD_WRITER_PIN=false
+# AF_XDP RX poll timeout (ms). 0 = busy-poll (one core hot, lowest wake jitter for a
+# single low-rate flow); >0 = block-and-yield. Default 5.
+#XDP_RX_POLL_MS=5
+# XDP need-wakeup flag on the TX path. Default true.
+#XDP_NEED_WAKEUP=true
+# TUN read-goroutine count. Default = number of CPUs. Set 1 to serialize tun ingest.
+#TUN_QUEUES=
+# Run QUIC on a kernel UDP socket instead of AF_XDP (forward-return still uses AF_XDP).
+# Default false.
+#QUIC_KERNEL_UDP=false
+# Route small inner-TCP ACKs (<128B) via the kernel raw socket so their timing stays
+# clean (bulk stays on the forward egress). Default true.
+#FORWARD_ACK_VIA_SOCKET=true
+# Route XDP-eligible forwarded packets via AF_PACKET (kernel qdisc TX) not AF_XDP.
+# Default false.
+#FORWARD_KERNEL_TX=false
+# io_uring-batched writes on the IFF_NAPI forward TUN. Default false.
+#FORWARD_TUN_URING=false
+# Forward via an IFF_NAPI TUN (kernel GRO + host-TSO). Default false.
+#FORWARD_TUN_NAPI=false
+# Disable GSO coalescing on the tun-GSO egress. Default false.
+#FORWARD_TUN_NOCOALESCE=false
+# Max segments per GSO super-frame (1..64). Default 64.
+#FORWARD_TUN_GSO_MAXSEGS=64
+# Idle (microseconds) before an open GSO super-frame is flushed. Default 120.
+#FORWARD_TUN_GSO_FLUSH_IDLE_US=120
+# Upload-path inner-TCP-seq resequencer (needed for clean GSO/GRO coalescing).
+# Default ON whenever a coalescing egress (tun-GSO/vhost) is active; set true/false
+# to force.
+#FORWARD_UPLOAD_RESEQ=
+# Resequencer window: max buffered out-of-order segments per flow. Default 64.
+#FORWARD_UPLOAD_RESEQ_WINDOW=64
+# Resequencer max age (microseconds) before a stalled flow is flushed. Default 2000.
+#FORWARD_UPLOAD_RESEQ_MAXAGE_US=2000

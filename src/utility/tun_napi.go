@@ -53,7 +53,8 @@ func writeProc(path, val string) { _ = os.WriteFile(path, []byte(val), 0o644) }
 // GRO only coalesces segments landing in the same NAPI poll, so the forward consumer
 // must write bursts back-to-back (the pktChan drain loop does). Input must be in order
 // (GRO flushes on OOO) — pair with FORWARD_UPLOAD_RESEQ. Keep ethtool -K eth0 gso/tso on.
-var forwardViaNapiTun = os.Getenv("FORWARD_TUN_NAPI") == "1"
+// Off by default; set FORWARD_TUN_NAPI=true in tmasqued.conf (applied by LoadConfig).
+var forwardViaNapiTun = false
 
 const (
 	napiTunName = "tmnapi0"

@@ -161,7 +161,7 @@ const (
 // producer and the AF_XDP one (utility.TunAdapterSends) → reorder source.
 var tunLoopSends atomic.Uint64
 
-// writerPinSeq assigns round-robin CPUs to pinned forward writers (FORWARD_WRITER_PIN=1).
+// writerPinSeq assigns round-robin CPUs to pinned forward writers (FORWARD_WRITER_PIN).
 var writerPinSeq atomic.Uint64
 
 // fwdRounds/fwdRoundPkts measure forward drain-round chunk size (avg pkts the
@@ -191,6 +191,10 @@ func main() {
 	}(ctx)
 
 	config.Load(&ctx)
+	// Thread the parsed config into the low-level forward/xdp packages (they have no
+	// ctx of their own). Must run before any forward egress / RX loop starts.
+	utility.LoadConfig(ctx)
+	xdp.LoadConfig(ctx)
 	logLevel := ctx.Value("LOG_LEVEL").(string)
 	logPath := constants.LOG_PATH
 	logger.UpdateLogLevelName(logLevel)
@@ -690,13 +694,11 @@ func buildLocalLANs(wanIface string) []netip.Prefix {
 }
 
 func createTunTapDevice(ctx context.Context, virtIp string, virtPrefixLen int, mtu int, gso bool) ([]*water.Interface, error) {
-	numQueues := runtime.NumCPU()
 	// TUN_QUEUES overrides the tun-read goroutine count (default = NumCPU). Set to 1
 	// to serialize tun ingest when diagnosing download reorder.
-	if v := os.Getenv("TUN_QUEUES"); v != "" {
-		if n, err := strconv.Atoi(v); err == nil && n > 0 {
-			numQueues = n
-		}
+	numQueues := config.Int(ctx, "TUN_QUEUES", runtime.NumCPU())
+	if numQueues <= 0 {
+		numQueues = runtime.NumCPU()
 	}
 	devs := make([]*water.Interface, numQueues)
 
@@ -891,7 +893,7 @@ func run(ctxt context.Context, upChan chan<- bool, bindTo netip.AddrPort, ipProt
 	// AF_XDP. We skip registering xsks_quic on every NIC (so XDP passes UDP/443 to the
 	// kernel) and hand quic-go a net.ListenUDP socket; the AF_XDP Conns are kept ONLY
 	// for the forward-return dispatch (xsks_fwd).
-	quicKernelUDP := os.Getenv("QUIC_KERNEL_UDP") == "1"
+	quicKernelUDP := config.Bool(ctxt, "QUIC_KERNEL_UDP", false)
 
 	// Build one AF_XDP Conn per real NIC. QUIC-listen NICs register xsks_quic; ALL
 	// NICs register xsks_fwd (reverse-NAT return). Channels are maximized per NIC so
@@ -1384,30 +1386,16 @@ func handleConn(ctx context.Context, tunChan chan *utility.Packet, conn *connect
 		// sized gaps that collapse the inner-TCP cwnd. Resequencing by inner TCP seq
 		// BEFORE coalescing restores an in-order stream.
 		// DEFAULT = ON whenever the forward egress coalesces (tun-GSO/vhost — the
-		// bench-validated pairing); overridable via FORWARD_UPLOAD_RESEQ in the env
-		// (highest precedence, no rebuild) or tmasqued.conf. window/maxAge env-tunable.
-		uploadReseqOn := utility.ForwardCoalesces()
-		if v := os.Getenv("FORWARD_UPLOAD_RESEQ"); v != "" {
-			uploadReseqOn = v == "1" || v == "true"
-		} else if v, ok := ctx.Value("FORWARD_UPLOAD_RESEQ").(string); ok && v != "" {
-			if b, err := strconv.ParseBool(v); err == nil {
-				uploadReseqOn = b
-			}
-		}
+		// bench-validated pairing); override via FORWARD_UPLOAD_RESEQ in tmasqued.conf.
+		// window/maxAge tunable via FORWARD_UPLOAD_RESEQ_WINDOW / _MAXAGE_US.
+		uploadReseqOn := config.Bool(ctx, "FORWARD_UPLOAD_RESEQ", utility.ForwardCoalesces())
 		var uploadReseq *utility.ForwardReseq
 		if uploadReseqOn {
-			win := 64
-			if s := os.Getenv("FORWARD_UPLOAD_RESEQ_WINDOW"); s != "" {
-				if n, e := strconv.Atoi(s); e == nil && n > 0 {
-					win = n
-				}
+			win := config.Int(ctx, "FORWARD_UPLOAD_RESEQ_WINDOW", 64)
+			if win <= 0 {
+				win = 64
 			}
-			maxAge := 2 * time.Millisecond
-			if s := os.Getenv("FORWARD_UPLOAD_RESEQ_MAXAGE_US"); s != "" {
-				if n, e := strconv.Atoi(s); e == nil && n > 0 {
-					maxAge = time.Duration(n) * time.Microsecond
-				}
-			}
+			maxAge := time.Duration(config.Int(ctx, "FORWARD_UPLOAD_RESEQ_MAXAGE_US", 2000)) * time.Microsecond
 			uploadReseq = utility.NewForwardReseq(win, maxAge)
 			if logger.ShouldLog(logger.INFO) {
 				logger.Info(fmt.Sprintf("upload-forward reseq ON: window=%d maxAge=%v", win, maxAge))
@@ -1533,13 +1521,14 @@ func handleConn(ctx context.Context, tunChan chan *utility.Packet, conn *connect
 			utility.PacketPool.Put(pkt)
 		}
 
-		// FORWARD_WRITER_PIN=1 (experiment): pin this forward-writer goroutine to a
-		// fixed CPU (LockOSThread + sched_setaffinity). The whole kernel forward path
-		// (tun write → ip_forward → NIC TX) runs inline on this goroutine's CPU, and
-		// XPS maps CPU→txq — an unpinned writer migrates, flapping the TX queue,
-		// which on RSS-less virtio flaps the host's mirrored RX steering (spray).
-		// Pinning stabilizes CPU → txq → host steering, and keeps caches warm.
-		if os.Getenv("FORWARD_WRITER_PIN") == "1" {
+		// FORWARD_WRITER_PIN (default OFF; set =true in tmasqued.conf to enable): pin
+		// this forward-writer goroutine to a fixed CPU (LockOSThread + sched_setaffinity).
+		// The whole kernel forward path (tun write → ip_forward → NIC TX) runs inline on
+		// this goroutine's CPU, and XPS maps CPU→txq — an unpinned writer migrates,
+		// flapping the TX queue, which on RSS-less virtio flaps the host's mirrored RX
+		// steering (spray). A/B (2026-06-14) measured it NEUTRAL at RSS (the production
+		// setting) and noisy/inconclusive under single-queue, so it ships OFF.
+		if config.Bool(ctx, "FORWARD_WRITER_PIN", false) {
 			runtime.LockOSThread()
 			cpu := int(writerPinSeq.Add(1)-1) % runtime.NumCPU()
 			var set unix.CPUSet

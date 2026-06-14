@@ -4,7 +4,6 @@ package utility
 
 import (
     "net"
-    "os"
 
     "golang.org/x/sys/unix"
 )
@@ -18,8 +17,9 @@ import (
 // Mbit). The kernel raw socket — the same path local-deliver (tunTapDevice) and
 // WireGuard use — delivers sparse ACKs with clean timing, so the sender ramps.
 // Bulk traffic (>=128B) stays on the forward egress, where batching wins.
-// On by default; kill switch: FORWARD_ACK_VIA_SOCKET=0. Read once at startup.
-var forwardAckViaSocket = os.Getenv("FORWARD_ACK_VIA_SOCKET") != "0"
+// On by default; set FORWARD_ACK_VIA_SOCKET=false in tmasqued.conf to disable
+// (applied at startup by LoadConfig).
+var forwardAckViaSocket = true
 
 // forwardViaPacket routes XDP-eligible forwarded packets through an AF_PACKET-bound
 // L2 egress (PacketBatch, one sendmmsg per batch) instead of AF_XDP TX. This is the
@@ -33,7 +33,8 @@ var forwardAckViaSocket = os.Getenv("FORWARD_ACK_VIA_SOCKET") != "0"
 // the qdisc. NOTE: FORWARD_TUN_GSO is NOT dead — it was rebuilt with the corrected TCP
 // checksum seed (tun_gso.go) and now coalesces TSO super-frames into the MAIN water tun
 // (IFF_VNET_HDR) instead of a dedicated tmfwd0 device; selected via SetForwardMode.
-var forwardViaPacket = os.Getenv("FORWARD_KERNEL_TX") == "1"
+// Off by default; set FORWARD_KERNEL_TX=true in tmasqued.conf (applied by LoadConfig).
+var forwardViaPacket = false
 
 // SetForwardMode selects the upload-forward egress from config (FORWARD_TUN_GSO /
 // FORWARD_TUN_VHOST in tmasqued.conf), replacing the old env-var package init. Must be

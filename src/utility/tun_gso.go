@@ -7,8 +7,6 @@ import (
 	"expvar"
 	"fmt"
 	"net"
-	"os"
-	"strconv"
 	"time"
 
 	"golang.org/x/sys/unix"
@@ -38,27 +36,14 @@ const (
 	ipprotoTCPv4 = 6
 )
 
-var tunMaxSegs = func() int {
-	if s := os.Getenv("FORWARD_TUN_GSO_MAXSEGS"); s != "" {
-		if n, e := strconv.Atoi(s); e == nil && n >= 1 && n <= gsoMaxSegs {
-			return n
-		}
-	}
-	return gsoMaxSegs
-}()
+// Forward tun-GSO knobs; defaults here, overridable via tmasqued.conf (LoadConfig).
+var tunMaxSegs = gsoMaxSegs // FORWARD_TUN_GSO_MAXSEGS (1..gsoMaxSegs)
 
-var tunNoCoalesce = os.Getenv("FORWARD_TUN_NOCOALESCE") == "1"
+var tunNoCoalesce = false // FORWARD_TUN_NOCOALESCE
 
 // flushIdle: an open super-frame untouched this long is finalized (the latency
-// bound on coalescing). Env-tunable for experiments: FORWARD_TUN_GSO_FLUSH_IDLE_US.
-var flushIdle = func() time.Duration {
-	if s := os.Getenv("FORWARD_TUN_GSO_FLUSH_IDLE_US"); s != "" {
-		if n, e := strconv.Atoi(s); e == nil && n > 0 {
-			return time.Duration(n) * time.Microsecond
-		}
-	}
-	return 120 * time.Microsecond
-}()
+// bound on coalescing). Tunable via FORWARD_TUN_GSO_FLUSH_IDLE_US.
+var flushIdle = 120 * time.Microsecond
 
 var (
 	tunGsoWrites = expvar.NewInt("tun_gso_writes")

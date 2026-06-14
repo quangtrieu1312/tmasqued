@@ -3,13 +3,12 @@
 package xdp
 
 import (
+	"context"
 	"encoding/binary"
 	"expvar"
 	"fmt"
 	"net"
 	"net/netip"
-	"os"
-	"strconv"
 	"sync/atomic"
 	"sync"
 	"time"
@@ -18,6 +17,7 @@ import (
 	"github.com/cilium/ebpf"
 	"golang.org/x/sys/unix"
 
+	"github.com/quangtrieu1312/tmasqued/config"
 	"github.com/quangtrieu1312/tmasqued/logger"
 )
 
@@ -27,15 +27,17 @@ import (
 // jitter that is fatal to a single low-rate inner-TCP flow). Set XDP_RX_POLL_MS=0
 // to BUSY-POLL: the loop spins (one core hot) and never yields, eliminating the
 // deschedule/wake jitter on both the upload (QUIC ingest) and download (NAT-return
-// ingest + inline SendDatagram) paths. Read once at startup.
-var rxPollTimeoutMs = func() int {
-	if v := os.Getenv("XDP_RX_POLL_MS"); v != "" {
-		if n, err := strconv.Atoi(v); err == nil && n >= 0 {
-			return n
-		}
+// ingest + inline SendDatagram) paths. Default 5; overridable via tmasqued.conf
+// (applied at startup by LoadConfig).
+var rxPollTimeoutMs = 5
+
+// LoadConfig applies the xdp tuning knobs from the tmasqued.conf context. Call once
+// at startup (after config.Load, before the RX loop starts).
+func LoadConfig(ctx context.Context) {
+	if n := config.Int(ctx, "XDP_RX_POLL_MS", rxPollTimeoutMs); n >= 0 {
+		rxPollTimeoutMs = n
 	}
-	return 5
-}()
+}
 
 const (
     ethHdr   = 14

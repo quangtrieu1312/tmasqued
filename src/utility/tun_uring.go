@@ -5,7 +5,6 @@ package utility
 import (
 	"expvar"
 	"net"
-	"os"
 )
 
 // FORWARD_TUN_URING: forward via the SAME IFF_NAPI TUN as FORWARD_TUN_NAPI (so the
@@ -16,7 +15,8 @@ import (
 // (590M) trails AF_PACKET (912M) on the per-packet write() — not CPU-bound (no core
 // pegged), so it's write syscall overhead/latency. io_uring batches the submission to
 // recover the throughput while keeping the ordering. Pair with FORWARD_UPLOAD_RESEQ.
-var forwardViaUring = os.Getenv("FORWARD_TUN_URING") == "1"
+// Off by default; set FORWARD_TUN_URING=true in tmasqued.conf (applied by LoadConfig).
+var forwardViaUring = false
 
 const uringDepth = 512
 
