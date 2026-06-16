@@ -43,17 +43,17 @@ actually get, summed over all clients — for an **upload** run at **RSS** (high
 
 **16-core gateway, 7 clients:**
 
-| inner MTU | c→GW | GW→t | tmasque | wg-k | wg-u | ovpn-k | ovpn-u |
-|---|--:|--:|--:|--:|--:|--:|--:|
-| 1500         | 64.1 | 90.9 | 5.0 | 9.5  | 2.3 | 2.0 | 0.4 |
-| 9000 (jumbo) | 62.4 | 87.0 | 9.5 | 22.6 | 5.2 | 6.3 | 2.2 |
+| inner MTU | tmasque |
+|---|--:|
+| 1500         | 5.0 |
+| 9000 (jumbo) | 9.5 |
 
 **2-core gateway, 2 clients:**
 
-| inner MTU | tmasque | wg-k | wg-u | ovpn-k | ovpn-u |
-|---|--:|--:|--:|--:|--:|
-| 1500         | 2.0 | 2.4 | 4.8 | 1.2 | 0.3 |
-| 9000 (jumbo) | 3.5 | 5.7 | 8.9 | 3.7 | 1.0 |
+| inner MTU | tmasque |
+|---|--:|
+| 1500         | 2.0 |
+| 9000 (jumbo) | 3.5 |
 
 tmasque's AF_XDP-native path caps the jumbo *outer* MTU at 3506 (inner 3422 — `virtio_net` won't
 attach XDP above 3506), vs kernel WireGuard's full 8920.
