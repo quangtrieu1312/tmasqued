@@ -9,7 +9,7 @@ who want to **contribute** to the server or **troubleshoot the database** direct
 ```
 main.go            QUIC listener, per-client tunChan map, forward consumer (SNAT + TX)
 management.go      the management HTTP API (Unix socket) — routing + validation
-xdp/               AF_XDP conn, eBPF loader, RX dispatch (QUIC vs NAT-return)
+xdp/               AF_XDP conn, eBPF loader, RX dispatch (QUIC vs NAT-return), session table
 utility/           ForwardBatch (AF_XDP/kernel TX split), SNAT, reseq, GSO helpers
 config/            reads tmasqued.conf into context; inotify hot-reload (LOG_LEVEL, ENABLE_STATISTIC)
 stats/             the independent on/off STATISTIC channel (separate from the leveled logger)
