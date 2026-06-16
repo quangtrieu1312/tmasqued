@@ -4,23 +4,12 @@
 [RFC 9484 CONNECT-IP](https://datatracker.ietf.org/doc/rfc9484/)). It terminates QUIC
 connections from clients, assigns each a `/32` and a set of routes, and forwards their
 traffic to the WAN — over a **kernel-bypass AF_XDP datapath**, **benchmarked head-to-head
-against kernel WireGuard and a no-VPN direct baseline on a multi-Gbit/s testbed**
-(single- and multi-client, both directions, at 1500 and jumbo MTU; see *Performance* for the
-headline and [BENCHMARKS.md](BENCHMARKS.md) for the full matrix and honest scope).
+against kernel WireGuard and a no-VPN direct baseline** (single- and multi-client, both
+directions, at 1500 and jumbo MTU). See *Performance* below for the headline, and
+[**tmasque-bench**](https://github.com/quangtrieu1312/tmasque-bench) for the full per-regime grid and honest scope.
 
 > Client counterpart: [`tmasque`](https://github.com/quangtrieu1312/tmasque).
 > Umbrella repo (setup, certs, management): [`masque-vpn`](https://github.com/quangtrieu1312/masque-vpn).
-
-**Highlights**
-- Userspace **MASQUE/QUIC VPN** (RFC 9484 CONNECT-IP) with a **kernel-bypass AF_XDP + eBPF
-  datapath** and **reverse NAT done entirely in XDP** — the bulk forward path stays out of the
-  kernel network stack (sparse feedback ACKs and local delivery use the kernel by design).
-- On 2-vCPU VMs it lands **within low-single-digit Gbit/s of kernel WireGuard**, and — at the
-  jumbo inner MTU it's built for — splits the gateway **evenly across concurrent clients** where
-  WireGuard starves one.
-- Traced a single-stream throughput **collapse to an AF_XDP-TX / ACK-clock timing root cause**
-  and fixed it (bulk on AF_XDP, sparse feedback ACKs back through the kernel) — restoring
-  single-stream download to parity.
 
 ---
 
@@ -32,42 +21,55 @@ user/kernel boundary, runs through the QUIC state machine, and rides an HTTP/3 d
 `tmasqued` closes that gap with two moves: it pulls packets off the NIC with **AF_XDP**
 (kernel stack bypassed, and the return NAT runs in the XDP program itself), and it runs the
 QUIC layer as a **CC-off datagram relay** so the inner TCP's own congestion control governs
-the flow (no "TCP-over-TCP" collapse). How each works is in *Data plane & performance
-engineering* below; how it measures up is in *Performance*.
+the flow (no "TCP-over-TCP" collapse). The *Architecture* diagram below shows how the pieces
+fit; how it measures up is in *Performance*.
 
 ---
 
 ## Performance
 
-Head-to-head against a **no-VPN direct baseline** and **kernel WireGuard** on a 5-VM EPYC-Rome
-(2 vCPU) testbed. Each cell is `iperf3 -P8 -t10 -O2` (**8 streams from one client**); 2-client cases
-run two clients concurrently to separate targets. `gw` = gateway CPU%. The 1500-MTU table,
-**client-to-client**, UDP, and full caveats: **[BENCHMARKS.md](BENCHMARKS.md)**.
+How much aggregate traffic the gateway forwards, at the production **RSS** (multi-queue) setting.
+The full matrix — both directions, all three NIC-steering settings, single- and multi-client — is
+in **[tmasque-bench](https://github.com/quangtrieu1312/tmasque-bench)**.
 
-### TCP at a jumbo inner MTU (Gbit/s, with gateway CPU%)
+**How to read:** every cell is **aggregate goodput in Gbit/s** — the useful TCP rate the receivers
+actually get, summed over all clients — for an **upload** run at **RSS** (higher is better). Columns:
 
-| case (8 streams) | direct | WireGuard | tmasque |
-|---|--:|--:|--:|
-| 1 client, up         | 21.5 (gw 0) | **3.35** (gw 82) | 2.05 (gw 66) |
-| 1 client, down       | 21.5 (gw 0) | 1.85 (gw 65) | 1.75 (gw 61) |
-| 2 clients, up (each) | 20.0 / 20.4 (gw 1) | 0.74 / 1.82 (gw 77) | **1.38 / 1.38** (gw 71) |
-| 2 clients, down(each)| 20.4 / 20.3 (gw 1) | 0.57 / 1.25 (gw 68) | 0.98 / 0.88 (gw 65) |
+- **tmasque** — this VPN (AF_XDP datapath, shipped `gso` default)
+- **wg-k** / **wg-u** — kernel WireGuard / userspace WireGuard (`wireguard-go`)
+- **ovpn-k** / **ovpn-u** — OpenVPN with the in-kernel DCO module / its userspace data channel
+- **c→GW** / **GW→t** — the raw network legs with every VPN *off* (client→gateway / gateway→target); reference ceilings (16-core only)
+- **`—`** — not measured (OpenVPN wasn't run on the 2-core set)
 
-**Reading it:**
-- **A jumbo inner MTU ~doubles VPN throughput** (tmasque 1-client up 1.17→2.05, WG 1.66→3.35 vs
-  the 1500 table) — it's tmasque's design point; direct is unaffected. (Why: see BENCHMARKS.md.)
-- **At jumbo, tmasque is fairer under concurrency** — two clients split the gateway *evenly*
-  (1.38 / 1.38, agg 2.76) and edge WG (0.74 / 1.82, agg 2.56), which starved one client. Per-flow-
-  affine datagram pacing spreads load. **Honest caveat:** at a 1500 inner MTU this flips — WG is
-  balanced and leads on aggregate (see BENCHMARKS.md); the edge is specific to the jumbo regime.
-- **WireGuard is faster on a 1-client upload** (3.35 vs 2.05) and **direct is ~6–10×** either VPN —
-  both are gateway-CPU-bound on 2 vCPU behind a **single NIC RX queue** (the real ceiling). A
-  separate *single-flow* download collapse (war story below) was a sparse-ACK pacing issue, fixed
-  by routing the small ACKs through the kernel.
+**16-core gateway, 7 clients:**
 
-**Takeaway:** at its jumbo design point this userspace QUIC/MASQUE tunnel matches kernel
-WireGuard's order of magnitude and is fairer across concurrent clients; at a 1500 inner MTU the
-kernel datapath leads. Both sit well behind a direct path.
+| inner MTU | c→GW | GW→t | tmasque | wg-k | wg-u | ovpn-k | ovpn-u |
+|---|--:|--:|--:|--:|--:|--:|--:|
+| 1500         | 64.1 | 90.9 | 5.0 | 9.5  | 2.3 | 2.0 | 0.4 |
+| 9000 (jumbo) | 62.4 | 87.0 | 9.5 | 22.6 | 5.2 | 6.3 | 2.2 |
+
+**2-core gateway, 2 clients:**
+
+| inner MTU | tmasque | wg-k | wg-u | ovpn-k | ovpn-u |
+|---|--:|--:|--:|--:|--:|
+| 1500         | 2.0 | 2.4 | 4.8 | 1.2 | 0.3 |
+| 9000 (jumbo) | 3.5 | 5.7 | 8.9 | 3.7 | 1.0 |
+
+tmasque's AF_XDP-native path caps the jumbo *outer* MTU at 3506 (inner 3422 — `virtio_net` won't
+attach XDP above 3506), vs kernel WireGuard's full 8920.
+
+**Takeaway:** on the 16-core box **kernel WireGuard leads at RSS** (it spreads across cores natively),
+while tmasque reaches ~10 G at jumbo and beats userspace WireGuard and both OpenVPN variants — all far
+below the ~62 G raw client→GW underlay, so the gap is userspace/crypto overhead, not the fabric. On
+the 2-core box tmasque trails both WireGuard variants (userspace WireGuard is fastest) — that small
+box is client/CPU-bound, not server-bound. Per-flow rate is inner-TCP-loss-bound; the
+single-RX-queue funnel and per-scenario breakdown are in tmasque-bench.
+
+> **RX-queue scaling.** tmasque binds **one AF_XDP `xsk` per NIC RX queue** (the eBPF redirects by
+> `ctx->rx_queue_index`), so with a multi-queue NIC (RSS) distinct client flows hash to distinct
+> queues → cores — the same way kernel WireGuard's softirq spreads. With a single RX queue both
+> serialize through one ring; RPS can't help tmasque (its AF_XDP path bypasses the kernel softirq).
+> The full none/rps/rss progression is in [tmasque-bench](https://github.com/quangtrieu1312/tmasque-bench).
 
 ---
 
@@ -89,9 +91,9 @@ client ------>+   :443 QUIC xsk -> connect-ip decap                             
               |                        v                           v                 |
               |                    TUN dev                 SNAT (userspace)          |
               |                  (kernel deliver)                  |                 |
-              |                                                  v                   |
-              |                                          forward TX -----------------+-->  WAN
-              |                                            bulk:  sendmmsg / XSK TX  |    (targets)
+              |                                                    v                 |
+              |                                              forward TX -------------+-->  WAN
+              |                                            bulk:  GSO into main tun  |    (targets)
               |                                            sparse ACKs:  kernel sock |
               |                                                                      |
 client <------+   QUIC TX  <-  re-encap     <-  in-kernel DNAT (xdp.c) <-------------+--  WAN
@@ -111,18 +113,7 @@ advertises those as CONNECT-IP routes. You manage clients, roles, and resources 
 
 ---
 
-## Data plane & performance engineering
-
-| Piece | What & why |
-|---|---|
-| **AF_XDP ingest** | An eBPF/XDP program (`src/xdp/xdp.c`) classifies inbound frames at the NIC and `XDP_REDIRECT`s them to `xsk` sockets — `:443` → QUIC socket, NAT-return → forward socket. Busy-poll (`XDP_RX_POLL_MS=0`) removes vCPU deschedule/wake jitter that otherwise starves a single low-rate flow. |
-| **In-kernel reverse NAT** | The **return path (DNAT)** runs entirely in the XDP program: it looks up a reverse-NAT BPF map, rewrites the destination IP+port back to the client, fixes the IP/TCP/UDP checksums incrementally (RFC 1624), and redirects to the AF_XDP socket — no kernel-stack traversal, no conntrack. The forward SNAT runs in userspace and populates that map. |
-| **CC disabled, pacer-gated** | Post-handshake `SendMode = SendAny`; the cwnd controller is bypassed and a floored pacer is the sole send gate. Inner-TCP loss can't drag the tunnel rate to zero. |
-| **IP-in-QUIC-DATAGRAM** | connect-ip context-0 framing over QUIC datagrams (unreliable). Forked quic-go gives a ring-buffered, drop-on-full datagram TX path (vs upstream's blocking single-slot queue). |
-| **MTU / datagram budget** | `InitialPacketSize` pinned so the datagram payload budget fits the tunnel MTU — a misconfigured budget silently swallowed `DatagramTooLargeError` and produced **0** download until fixed. |
-| **Inner-TCP buffer tuning** | The tunnel's added RTT enlarges the inner BDP; `tcp_wmem`/`tcp_rmem` are raised at bootstrap so a single inner stream isn't `sndbuf`-limited. |
-
-### The single-stream-download fix (war story)
+## The single-stream-download fix (postmortem)
 
 A single-stream **download** collapsed to ~5–10% of WireGuard — no loss, no ECN, no reorder, an
 open window, and *lower* RTT than WG, so every "where's the throttle?" probe came up empty. We sent
@@ -157,9 +148,6 @@ Requires Linux, Docker, `/dev/net/tun`, and a NIC/driver that supports XDP (nati
 generic mode works). The compose runs the container **privileged** (`NET_ADMIN` + `NET_RAW` +
 `SYS_ADMIN` — for the TUN device, the raw-socket ACK path, and eBPF/AF_XDP map management). First boot auto-generates the server
 and client CAs (Ed25519) and runs DB migrations.
-
-Key tuning env (compose): `XDP_RX_POLL_MS=0` (busy-poll), `TUNNEL_PACING_FLOOR_MBIT`,
-`XDP_NEED_WAKEUP`, `TUN_QUEUES`.
 
 ---
 

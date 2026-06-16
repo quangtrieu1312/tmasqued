@@ -7,4 +7,6 @@ certs/
 **_bpfel.go
 tmasqued.conf
 .env
+
+# raw benchmark results live in tmasque-harness; .md extracts live in tmasque-bench
 matrix-results/

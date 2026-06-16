@@ -3,12 +3,12 @@
 package xdp
 
 import (
+	"context"
 	"encoding/binary"
+	"expvar"
 	"fmt"
 	"net"
 	"net/netip"
-	"os"
-	"strconv"
 	"sync/atomic"
 	"sync"
 	"time"
@@ -17,6 +17,8 @@ import (
 	"github.com/cilium/ebpf"
 	"golang.org/x/sys/unix"
 
+	"github.com/quangtrieu1312/tmasqued/config"
+	"github.com/quangtrieu1312/tmasqued/logger"
 )
 
 // rxPollTimeoutMs is the timeout passed to poll() in the AF_XDP RX loop when the
@@ -25,20 +27,22 @@ import (
 // jitter that is fatal to a single low-rate inner-TCP flow). Set XDP_RX_POLL_MS=0
 // to BUSY-POLL: the loop spins (one core hot) and never yields, eliminating the
 // deschedule/wake jitter on both the upload (QUIC ingest) and download (NAT-return
-// ingest + inline SendDatagram) paths. Read once at startup.
-var rxPollTimeoutMs = func() int {
-	if v := os.Getenv("XDP_RX_POLL_MS"); v != "" {
-		if n, err := strconv.Atoi(v); err == nil && n >= 0 {
-			return n
-		}
+// ingest + inline SendDatagram) paths. Default 5; overridable via tmasqued.conf
+// (applied at startup by LoadConfig).
+var rxPollTimeoutMs = 5
+
+// LoadConfig applies the xdp tuning knobs from the tmasqued.conf context. Call once
+// at startup (after config.Load, before the RX loop starts).
+func LoadConfig(ctx context.Context) {
+	if n := config.Int(ctx, "XDP_RX_POLL_MS", rxPollTimeoutMs); n >= 0 {
+		rxPollTimeoutMs = n
 	}
-	return 5
-}()
+}
 
 const (
     ethHdr   = 14
-    maxFrameSize = ethHdr + 1500
-    umemFrameSize = 2048 // must match SocketOptions.FrameSize; upper bound on any RX frame
+    maxFrameSize = ethHdr + 4082
+    umemFrameSize = 4096 // must match SocketOptions.FrameSize; upper bound on any RX frame
 )
 
 // rxBufPool recycles the payload buffers handed to quic-go over quicCh,
@@ -51,6 +55,30 @@ var rxBufPool = sync.Pool{
         return &b
     },
 }
+
+// xskRxRounds/xskRxFrames measure RX batch size: frames-per-receive-round
+// (avg = xsk_rx_frames / xsk_rx_rounds). The de-batching diagnosis: under 16
+// queues each ring drains in small rounds; under 1 queue rounds are large.
+var (
+	xskRxRounds = expvar.NewInt("xsk_rx_rounds")
+	xskRxFrames = expvar.NewInt("xsk_rx_frames")
+)
+
+// quicShard is one queue's QUIC frame buffer (single producer, swept by the
+// single ReadFrom consumer). Bounded: full shard drops (counted) like the old
+// channel did.
+type quicShard struct {
+	mu  sync.Mutex
+	buf []quicFrame
+}
+
+const quicShardCap = 1024
+
+// quicRxSweeps/Frames measure consumer batch size (avg = frames/sweeps).
+var (
+	quicRxSweeps = expvar.NewInt("quic_rx_sweeps")
+	quicRxFrames = expvar.NewInt("quic_rx_frames")
+)
 
 // quicFrame is a QUIC/UDP payload delivered to quic-go via ReadFrom.
 type quicFrame struct {
@@ -70,10 +98,11 @@ type ForwardHandler func(ipPkt []byte, dstIP net.IP) bool
 // One XSK socket is created per NIC queue.
 type Conn struct {
 	sockets   []*xdp.Socket
-	txMus     []sync.Mutex // one per socket; guards that socket's TX + completion rings
+	txPumps   []*txPump // one per socket; single owner of that socket's TX ring (de-funnels TX)
 	localAddr *net.UDPAddr
 	srcMAC    net.HardwareAddr
 	gwMAC     net.HardwareAddr // next-hop fallback for IPs we haven't learned yet
+	ifindex   int              // WAN interface index (for AF_PACKET-bound forward egress)
 
 	// neigh is a copy-on-write IPv4→MAC neighbour table. We learn it by L2
 	// reverse-path: the source MAC of any inbound frame is, by definition, the
@@ -92,10 +121,26 @@ type Conn struct {
 	neigh   atomic.Pointer[map[netip.Addr]net.HardwareAddr]
 	neighMu sync.Mutex
 
+	// arpPending dedups in-flight async ARP probes for on-link LAN destinations
+	// (LanNextHopMAC). Keyed by netip.Addr; an entry means a probe goroutine is
+	// already resolving that destination, so we don't spawn another per packet.
+	arpPending sync.Map
+
 	txIdx     atomic.Uint64
 	done      chan struct{}
 	mode	XDPMode
-    quicCh chan quicFrame // QUIC/443 frames → ReadFrom
+	// QUIC/443 RX handoff: per-queue SHARDS instead of one shared channel.
+	// One producer (the queue's dispatch goroutine) per shard kills the 16-way
+	// chan-lock contention; the consumer (ReadFrom) sweeps all shards under one
+	// short lock each and serves frames from a local batch — amortizing the
+	// per-frame lock+wakeup that dominated the 16q profile (selectgo/lock2).
+	// Per-flow order: a flow lives on ONE queue → ONE shard (slice = FIFO) →
+	// batch sweep preserves intra-shard order. Cross-shard interleave is
+	// cross-flow and therefore unordered by definition.
+	quicShards []quicShard
+	rxNotify   chan struct{} // 1-buffered edge trigger: a shard went nonempty
+	rxPending  []quicFrame   // consumer-local batch (single ReadFrom caller)
+	rxPendIdx  int
     fwdHandler atomic.Pointer[ForwardHandler] // NAT-return delivery, called inline per dispatch shard
 	quicChDrops atomic.Uint64
 	fwdDrops    atomic.Uint64 // return packets with no matching session
@@ -118,6 +163,7 @@ func NewConn(
 	numQueues int,
 	mode XDPMode,
 	needWakeup bool,
+	quicViaKernel bool, // skip registering xsks_quic → UDP/443 falls through to the kernel
 ) (*Conn, error) {
 	// If localAddr has an unspecified IP (0.0.0.0), resolve the real
     // IP from the interface. The raw Ethernet frames we build need a
@@ -135,15 +181,31 @@ func NewConn(
 	if err != nil {
 		return nil, fmt.Errorf("resolving next-hop MAC: %w", err)
 	}
+	if gwMAC == nil && logger.ShouldLog(logger.INFO) {
+		// On-link LAN NIC (no gateway): egress MACs are resolved per destination
+		// (LanNextHopMAC) from return traffic / the kernel ARP table.
+		logger.Info(fmt.Sprintf("NIC %s has no gateway fallback (on-link LAN); per-destination next-hop resolution", iface.Name))
+	}
 
 	sockets := make([]*xdp.Socket, numQueues)
 	if mode == XDPModeGeneric {
     	xdp.DefaultSocketFlags = unix.XDP_COPY
 	}
+	// Native mode: always shoot for zero-copy first (virtio supports it on 6.11+,
+	// single-buffer), and fail over to copy mode when the driver rejects the bind.
+	// Forcing the flag (instead of flags=0 auto-negotiation) is deliberate: the
+	// bind result tells us which datapath we actually got, so it can be logged
+	// (auto mode falls back silently). The first queue's outcome decides for all
+	// queues — ZC support is per-driver, not per-queue.
+	zeroCopy := false
+	if mode != XDPModeGeneric {
+		xdp.DefaultSocketFlags = unix.XDP_ZEROCOPY
+		zeroCopy = true
+	}
 	for i := 0; i < numQueues; i++ {
 		opts := &xdp.SocketOptions{
     		NumFrames:              4096,  // 2048 TX + 2048 RX
-    		FrameSize:              2048,
+    		FrameSize:              4096,
     		FillRingNumDescs:       2048,
     		CompletionRingNumDescs: 2048,
     		RxRingNumDescs:         2048,
@@ -151,6 +213,18 @@ func NewConn(
     		UseNeedWakeup:          needWakeup,
 		}
 		sock, err := xdp.NewSocket(iface.Index, i, opts)
+		if err != nil && zeroCopy && i == 0 {
+			// driver can't do ZC (e.g. virtio without VIRTIO_F_ACCESS_PLATFORM,
+			// or any virtio on <6.11) → fail over to copy mode. Log the errno —
+			// it says WHY (EINVAL = dma-dev/queue gate, EOPNOTSUPP = no driver
+			// ZC support, EBUSY = queue occupied).
+			if logger.ShouldLog(logger.WARN) {
+				logger.Warn(fmt.Sprintf("AF_XDP zero-copy bind rejected (queue 0), falling back to copy: %v", err))
+			}
+			zeroCopy = false
+			xdp.DefaultSocketFlags = unix.XDP_COPY
+			sock, err = xdp.NewSocket(iface.Index, i, opts)
+		}
 		if err != nil {
 			closeSockets(sockets[:i])
 			return nil, fmt.Errorf("XSK queue %d (XDP mode %s): %w", i, mode, err)
@@ -159,10 +233,16 @@ func NewConn(
 		nFill := sock.NumFreeFillSlots()
     	sock.Fill(sock.GetDescs(nFill, true))
 
-		if err := xskQuicMap.Update(uint32(i), uint32(sock.FD()), ebpf.UpdateAny); err != nil {
-			sock.Close()
-			closeSockets(sockets[:i])
-			return nil, fmt.Errorf("xsks_quic update queue %d: %w", i, err)
+		// quicViaKernel: do NOT register xsks_quic, so the XDP prog's UDP/443 redirect
+		// (xdp.c: `if (lookup(xsks_quic)) redirect`) finds no socket and falls through to
+		// XDP_PASS → the kernel UDP stack receives QUIC. The forward-return path (xsks_fwd
+		// reverse-NAT redirect) is unaffected, so SNAT/return still work.
+		if !quicViaKernel {
+			if err := xskQuicMap.Update(uint32(i), uint32(sock.FD()), ebpf.UpdateAny); err != nil {
+				sock.Close()
+				closeSockets(sockets[:i])
+				return nil, fmt.Errorf("xsks_quic update queue %d: %w", i, err)
+			}
 		}
 
 		if err := xskFwdMap.Update(uint32(i), uint32(sock.FD()), ebpf.UpdateAny); err != nil {
@@ -174,15 +254,33 @@ func NewConn(
 		sockets[i] = sock
 	}
 
+	if logger.ShouldLog(logger.INFO) {
+		bindMode := "copy"
+		if zeroCopy {
+			bindMode = "zero-copy"
+		}
+		logger.Info(fmt.Sprintf("AF_XDP bind: %s", bindMode))
+	}
+
 	c := &Conn{
 		sockets:   sockets,
-		txMus:     make([]sync.Mutex, numQueues),
 		localAddr: frameLocalAddr,
 		srcMAC:    iface.HardwareAddr,
 		gwMAC:     gwMAC,
+		ifindex:   iface.Index,
 		done:      make(chan struct{}),
-		mode: mode,
-		quicCh:      make(chan quicFrame, 4096),
+		mode:      mode,
+		quicShards: make([]quicShard, numQueues),
+		rxNotify:   make(chan struct{}, 1),
+	}
+	// One TX pump per socket: the sole owner of that socket's TX + completion
+	// rings. All TX producers (QUIC WriteTo/WriteBatch + the forward path)
+	// enqueue lock-free instead of contending a shared txMu. This is the
+	// userspace analogue of the kernel's lockless qdisc that lets WireGuard
+	// saturate many cores on a single NIC queue.
+	c.txPumps = make([]*txPump, len(sockets))
+	for i := range sockets {
+		c.txPumps[i] = newTxPump(sockets[i], c.done)
 	}
 	// One dispatch goroutine per NIC queue. Each is the sole owner of its
 	// socket's RX ring, so RX needs no lock and spreads across cores when
@@ -197,6 +295,12 @@ func NewConn(
 // goroutine that calls Receive/Fill/GetDescs(true) on this socket, so the RX
 // path needs no lock. It reads every frame, inspects the destination port,
 // and routes to the appropriate channel.
+//
+// NOTE: a single-queue RX-worker fan-out (1 ring-drainer + 1 per-frame worker on
+// a 2nd core) was tried here and measured FLAT — the single-queue server ceiling
+// is TX-side (one AF_XDP TX ring + one txMu funnel + single-core softirq), not RX
+// dispatch, so engaging a 2nd core on RX buys nothing. See the perf log. The
+// multi-core de-funnel belongs on the M3 multi-queue NIC, not here.
 func (c *Conn) dispatchSocket(idx int) {
     sock := c.sockets[idx]
     pfds := []unix.PollFd{{Fd: int32(sock.FD()), Events: unix.POLLIN}}
@@ -227,6 +331,8 @@ func (c *Conn) dispatchSocket(idx int) {
             }
         }
 
+        xskRxRounds.Add(1)
+        xskRxFrames.Add(int64(numReady))
         descs := sock.Receive(numReady)
         for i := range descs {
             desc := descs[i]
@@ -243,7 +349,7 @@ func (c *Conn) dispatchSocket(idx int) {
                 c.learnNeighbour(netip.AddrFrom4(ip4), frame[6:12])
             }
 
-            c.dispatchFrame(frame, nil, sock, desc)
+            c.dispatchFrame(idx, frame, sock, desc)
         }
     }
 }
@@ -308,9 +414,51 @@ func (c *Conn) NextHopMACForIP(ip []byte) net.HardwareAddr {
     return c.gwMAC
 }
 
-// dispatchFrame routes a single raw Ethernet frame to quicCh or the fwd handler.
-// Called only from the owning dispatchSocket goroutine, so Fill needs no lock.
-func (c *Conn) dispatchFrame(frame, _ []byte, sock *xdp.Socket, desc xdp.Desc) {
+// LanNextHopMAC resolves the L2 next hop for an on-link LAN destination egressing
+// THIS NIC, for the AF_XDP-TX forward egress (which builds the Ethernet frame in
+// userspace and so needs the destination's MAC — unlike the tun-GSO/kernel egress,
+// which lets the kernel ARP). There is no gateway fallback on a LAN NIC, so:
+//   1. learned neighbour table (primed by this flow's XDP NAT-reverse return) — hot;
+//   2. on miss, the kernel ARP table once (cheap; the kernel keeps on-link entries
+//      warm), caching the hit into neigh so step 1 serves it next time;
+//   3. on a cold miss, a single deduped async ARP probe, returning nil so the caller
+//      bootstraps this packet through the kernel (which ARPs + delivers). Because the
+//      caller has ALREADY applied userspace SNAT, that kernel bootstrap keeps the
+//      same WAN source port as the AF_XDP path — the flow never changes 5-tuple.
+func (c *Conn) LanNextHopMAC(dst []byte) net.HardwareAddr {
+	a, ok := netip.AddrFromSlice(dst)
+	if !ok {
+		return nil
+	}
+	a = a.Unmap()
+	if m := c.neigh.Load(); m != nil {
+		if mac, ok := (*m)[a]; ok {
+			return mac
+		}
+	}
+	ip := a.AsSlice()
+	if mac, err := lookupNeighbourMAC(c.ifindex, ip); err == nil && len(mac) == 6 {
+		c.learnNeighbour(a, mac)
+		return mac
+	}
+	// Cold: probe once (deduped) so a later packet of this flow finds the entry.
+	if _, busy := c.arpPending.LoadOrStore(a, struct{}{}); !busy {
+		go func() {
+			defer c.arpPending.Delete(a)
+			_ = probeARP(ip)
+			for range 5 {
+				time.Sleep(200 * time.Millisecond)
+				if mac, err := lookupNeighbourMAC(c.ifindex, ip); err == nil && len(mac) == 6 {
+					c.learnNeighbour(a, mac)
+					return
+				}
+			}
+		}()
+	}
+	return nil
+}
+
+func (c *Conn) dispatchFrame(idx int, frame []byte, sock *xdp.Socket, desc xdp.Desc) {
     refill := func() {
         sock.Fill([]xdp.Desc{desc})
     }
@@ -336,7 +484,7 @@ func (c *Conn) dispatchFrame(frame, _ []byte, sock *xdp.Socket, desc xdp.Desc) {
             if len(frame) >= udpBase+4 {
                 dstPort := binary.BigEndian.Uint16(frame[udpBase+2 : udpBase+4])
                 if dstPort == 443 {
-                    c.dispatchQUIC(frame, sock, desc, ihl)
+                    c.dispatchQUIC(idx, frame, sock, desc, ihl)
                     return
                 }
             }
@@ -360,11 +508,22 @@ func (c *Conn) TxDrops() uint64     { return c.txDrops.Load() }
 // Ring depths are read without locking — a benign stats-only race, since each
 // RX ring has a single owner goroutine and TX rings are mutated under txMus[i].
 func (c *Conn) DiagSnapshot() string {
-	quicLen := len(c.quicCh)
-	quicCap := cap(c.quicCh)
+	quicLen := 0
+	for i := range c.quicShards {
+		sh := &c.quicShards[i]
+		sh.mu.Lock()
+		quicLen += len(sh.buf)
+		sh.mu.Unlock()
+	}
+	quicCap := quicShardCap * len(c.quicShards)
 
 	// Min free fill ring slots across all sockets (low = RX starvation risk).
 	minFill, minTxFree := 99999, 99999
+	// xsk KERNEL-level RX drops — the uninstrumented loss source. rxRingFull =
+	// the kernel dropped because the RX ring was full (the single dispatch
+	// goroutine couldn't drain a burst in time); fillEmpty = no fill buffers.
+	// These become inner-TCP retransmits (unreliable datagrams don't recover).
+	var rxDropped, rxRingFull, rxFillEmpty uint64
 	for _, s := range c.sockets {
 		if f := s.NumFreeFillSlots(); f < minFill {
 			minFill = f
@@ -372,18 +531,24 @@ func (c *Conn) DiagSnapshot() string {
 		if f := s.NumFreeTxSlots(); f < minTxFree {
 			minTxFree = f
 		}
+		if st, err := s.Stats(); err == nil {
+			rxDropped += st.KernelStats.Rx_dropped
+			rxRingFull += st.KernelStats.Rx_ring_full
+			rxFillEmpty += st.KernelStats.Rx_fill_ring_empty_descs
+		}
 	}
 
 	return fmt.Sprintf(
-		"quicCh=%d/%d(drops=%d) fwdDrops=%d txDrops=%d fillFree=%d txFree=%d",
+		"quicCh=%d/%d(drops=%d) fwdDrops=%d txDrops=%d fillFree=%d txFree=%d xskRxDrop=%d ringFull=%d fillEmpty=%d",
 		quicLen, quicCap, c.quicChDrops.Load(),
 		c.fwdDrops.Load(),
 		c.txDrops.Load(),
 		minFill, minTxFree,
+		rxDropped, rxRingFull, rxFillEmpty,
 	)
 }
 
-func (c *Conn) dispatchQUIC(frame []byte, sock *xdp.Socket, desc xdp.Desc, ihl int) {
+func (c *Conn) dispatchQUIC(idx int, frame []byte, sock *xdp.Socket, desc xdp.Desc, ihl int) {
     // Strip eth(14) + ipv4(ihl) + udp(8). Read everything out of the frame
     // BEFORE refilling, since Fill hands the buffer back to the kernel.
     udpBase := ethHdr + ihl
@@ -404,13 +569,19 @@ func (c *Conn) dispatchQUIC(frame []byte, sock *xdp.Socket, desc xdp.Desc, ihl i
 
     sock.Fill([]xdp.Desc{desc})
 
+    sh := &c.quicShards[idx]
+    sh.mu.Lock()
+    if len(sh.buf) >= quicShardCap {
+        sh.mu.Unlock()
+        rxBufPool.Put(bufp)
+        c.quicChDrops.Add(1)
+        return
+    }
+    sh.buf = append(sh.buf, quicFrame{n: n, addr: &net.UDPAddr{IP: srcIP, Port: int(srcPort)}, data: data, bufp: bufp})
+    sh.mu.Unlock()
     select {
-    	case c.quicCh <- quicFrame{n: n, addr: &net.UDPAddr{IP: srcIP, Port: int(srcPort)}, data: data, bufp: bufp}:
-    	case <-c.done:
-			rxBufPool.Put(bufp)
-		default:
-			rxBufPool.Put(bufp)
-			c.quicChDrops.Add(1)
+    case c.rxNotify <- struct{}{}:
+    default:
     }
 }
 
@@ -443,14 +614,38 @@ func (c *Conn) dispatchFwd(frame []byte, sock *xdp.Socket, desc xdp.Desc) {
 // ReadFrom satisfies net.PacketConn and returns only QUIC/443 payloads
 // to quic-go. It will never see NAT-return tunnel traffic again.
 func (c *Conn) ReadFrom(p []byte) (int, net.Addr, error) {
-	select {
-    case <-c.done:
-        return 0, nil, net.ErrClosed
-    case f := <-c.quicCh:
-        n := copy(p, f.data)
-        rxBufPool.Put(f.bufp) // quic-go copied into p; backing buffer is free now
-        return n, f.addr, nil
-    }
+	for {
+		if c.rxPendIdx < len(c.rxPending) {
+			f := c.rxPending[c.rxPendIdx]
+			c.rxPending[c.rxPendIdx] = quicFrame{} // drop refs for GC
+			c.rxPendIdx++
+			n := copy(p, f.data)
+			rxBufPool.Put(f.bufp) // quic-go copied into p; backing buffer is free now
+			return n, f.addr, nil
+		}
+		// local batch exhausted: sweep every shard once (short lock each).
+		c.rxPending = c.rxPending[:0]
+		c.rxPendIdx = 0
+		for i := range c.quicShards {
+			sh := &c.quicShards[i]
+			sh.mu.Lock()
+			if len(sh.buf) > 0 {
+				c.rxPending = append(c.rxPending, sh.buf...)
+				sh.buf = sh.buf[:0]
+			}
+			sh.mu.Unlock()
+		}
+		if len(c.rxPending) > 0 {
+			quicRxSweeps.Add(1)
+			quicRxFrames.Add(int64(len(c.rxPending)))
+			continue
+		}
+		select {
+		case <-c.done:
+			return 0, nil, net.ErrClosed
+		case <-c.rxNotify:
+		}
+	}
 }
 
 // WriteTo builds a raw Ethernet+IPv4+UDP frame and sends it via AF_XDP.
@@ -484,37 +679,17 @@ func (c *Conn) WriteTo(p []byte, addr net.Addr) (int, error) {
 
 	// Stable per-connection queue (see txSocketIdx) — NOT round-robin.
 	idx := c.txSocketIdx(dst)
-	sock := c.sockets[idx]
-	txMu := &c.txMus[idx]
-
-	// Reap completed TX descriptors before allocating new ones,
-	// so the UMEM free pool never exhausts.
-	txMu.Lock()
-	if nc := sock.NumCompleted(); nc > 0 {
-		sock.Complete(nc)
-	}
-
-	descs := sock.GetDescs(1, false)
-	txMu.Unlock()
-	if len(descs) == 0 {
-		// TX UMEM exhausted — drop silently. Returning an error here would
-		// cause quic-go to treat the write as fatal and close the connection.
-		// Like UDP ENOBUFS, we drop and let QUIC's retransmit recover.
-		c.txDrops.Add(1)
-		return len(p), nil
-	}
-	frame := sock.GetFrame(descs[0])
 
 	// Per-client next hop: address the frame to the MAC learned from this
 	// client's own inbound traffic (gwMAC fallback until first packet seen).
 	dstMAC := c.NextHopMACForIP(dst.IP)
 
-	total := buildUDPFrame(frame, c.srcMAC, dstMAC, c.localAddr, dst, p)
-	descs[0].Len = uint32(total)
-
-	txMu.Lock()
-	sock.Transmit(descs)
-	txMu.Unlock()
+	// Build the L2 frame on the stack and hand it to this socket's TX pump.
+	// The pump (single ring owner) does Complete/GetDescs/Transmit — no lock
+	// here, so concurrent connections never serialize on a shared txMu.
+	var frame [txPumpFrameCap]byte
+	total := buildUDPFrame(frame[:], c.srcMAC, dstMAC, c.localAddr, dst, p)
+	c.txPumps[idx].Submit(frame[:total])
 	return len(p), nil
 }
 
@@ -628,14 +803,19 @@ func resolveIfaceIP(iface *net.Interface) (net.IP, error) {
     return nil, fmt.Errorf("no IPv4 address found on %s", iface.Name)
 }
 
-// ForwardSocket returns an XDP socket, its Ethernet parameters, and the mutex
-// guarding that socket's TX ring, for constructing a utility.XDPBatch.
-// Queues are selected round-robin — same as WriteTo. The returned mutex is the
-// per-socket TX lock, so forward batches on different sockets don't contend.
-func (c *Conn) ForwardSocket() (*xdp.Socket, net.HardwareAddr, net.HardwareAddr, bool, *sync.Mutex) {
+// ForwardPump returns a TX pump (single owner of a socket's TX ring) and its
+// Ethernet parameters, for constructing a utility.XDPBatch. Queues are selected
+// round-robin. Submitting to the pump is lock-free, so forward consumers no
+// longer serialize on a shared per-socket TX mutex — this was the single largest
+// source of aggregate-throughput contention on a single-queue NIC.
+func (c *Conn) ForwardPump() (*txPump, net.HardwareAddr, net.HardwareAddr, bool) {
     idx := int(c.txIdx.Add(1) % uint64(len(c.sockets)))
-    return c.sockets[idx], c.srcMAC, c.gwMAC, c.mode == XDPModeGeneric, &c.txMus[idx]
+    return c.txPumps[idx], c.srcMAC, c.gwMAC, c.mode == XDPModeGeneric
 }
+
+// WanIfindex returns the WAN interface index, used to bind an AF_PACKET socket
+// for the kernel-TX (qdisc/GSO) forward egress path.
+func (c *Conn) WanIfindex() int { return c.ifindex }
 
 // WriteBatch sends a batch of QUIC packets in a single XDP TX kick.
 // Called by basicConn.WriteBatch via the nativeBatcher interface check.
@@ -663,36 +843,14 @@ func (c *Conn) WriteBatch(pkts [][]byte, addr net.Addr) error {
 	// packet of one QUIC connection on one TX queue so the inner stream (incl. the
 	// tunneled ACK return path) stays in order; bonded tunnels still spread queues.
 	idx := c.txSocketIdx(dst)
-	sock := c.sockets[idx]
-	txMu := &c.txMus[idx]
+	pump := c.txPumps[idx]
 
-	txMu.Lock()
-	if nc := sock.NumCompleted(); nc > 0 {
-		sock.Complete(nc)
+	// Build each frame and enqueue to the TX pump (single ring owner). FIFO +
+	// single producer per connection preserves this connection's packet order.
+	var frame [txPumpFrameCap]byte
+	for i := 0; i < n; i++ {
+		total := buildUDPFrame(frame[:], c.srcMAC, dstMAC, c.localAddr, dst, pkts[i])
+		pump.Submit(frame[:total])
 	}
-
-	descs := sock.GetDescs(n, false)
-	txMu.Unlock()
-	got := len(descs)
-	if got < n {
-		// Partial or zero allocation — UMEM low. Count drops and proceed with
-		// what we have. Do NOT return an error: quic-go closes the connection
-		// on any non-temporary write error. Like UDP ENOBUFS, drop silently.
-		c.txDrops.Add(uint64(n - got))
-		if got == 0 {
-			return nil
-		}
-	}
-
-	// Fill only as many frames as descriptors we actually got
-	for i := 0; i < got; i++ {
-		frame := sock.GetFrame(descs[i])
-		total := buildUDPFrame(frame, c.srcMAC, dstMAC, c.localAddr, dst, pkts[i])
-		descs[i].Len = uint32(total)
-	}
-
-	txMu.Lock()
-	sock.Transmit(descs)
-	txMu.Unlock()
 	return nil
 }

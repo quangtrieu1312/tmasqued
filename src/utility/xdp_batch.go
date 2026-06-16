@@ -7,13 +7,19 @@ import (
 	"expvar"
 	"fmt"
 	"net"
-	"sync"
 	"sync/atomic"
 
-	"github.com/slavc/xdp"
 	"golang.org/x/net/ipv4"
 	"golang.org/x/net/ipv6"
 )
+
+// FrameSubmitter accepts a complete L2 frame for transmission. It is satisfied
+// by *xdp.txPump (the single-owner TX ring pump); declaring it here lets the
+// utility package enqueue frames without importing the xdp package (avoiding a
+// cycle, since xdp depends on utility).
+type FrameSubmitter interface {
+	Submit(frame []byte)
+}
 
 const MaxXDPBatchSize = 1024
 
@@ -21,7 +27,7 @@ const MaxXDPBatchSize = 1024
 const ethHdrSize = 14
 
 // maxFrameSize is the largest L2 frame we'll ever build: Ethernet + 1500-byte MTU.
-const maxFrameSize = ethHdrSize + 1500
+const maxFrameSize = ethHdrSize + 4082
 
 var totalXDPFlushes atomic.Int64
 var totalXDPPackets atomic.Int64
@@ -35,33 +41,27 @@ var xdpFwdTxDrops = expvar.NewInt("xdp_fwd_tx_drops")
 // XDPBatch accumulates raw L3 IP packets and flushes them in one XDP batch
 // transmit, replacing the sendmmsg-based SocketBatch.
 type XDPBatch struct {
-	sock        *xdp.Socket
-	srcMAC      net.HardwareAddr
-	dstMAC      net.HardwareAddr
-	genericMode bool // true → XDP_COPY/generic path; kick via unix.Send
-	mu          *sync.Mutex
+	pump   FrameSubmitter
+	srcMAC net.HardwareAddr
+	dstMAC net.HardwareAddr
 
 	// Pre-allocated frame buffers.  Each slot holds an Ethernet-wrapped
-	// copy of the original IP packet, ready to copy into UMEM.
+	// copy of the original IP packet, ready to hand to the TX pump.
 	bufs  [MaxXDPBatchSize][maxFrameSize]byte
 	lens  [MaxXDPBatchSize]int // actual frame length for bufs[i]
 	count int
 }
 
-// NewXDPBatch creates an XDPBatch for sock.
+// NewXDPBatch creates an XDPBatch that enqueues frames to pump.
 //
 //   - srcMAC / dstMAC are the Ethernet addresses stamped on every frame.
-//   - genericMode selects the TX kick strategy: true → XDP_COPY (unix.Send),
-//     false → native driver (sock.Poll).
-//   - mu is the caller's TX mutex that guards sock; it is held for the
-//     entire Flush operation, matching the pattern in Conn.WriteTo.
-func NewXDPBatch(sock *xdp.Socket, srcMAC, dstMAC net.HardwareAddr, genericMode bool, mu *sync.Mutex) *XDPBatch {
+//   - pump is the single-owner TX ring pump; Flush hands it each built frame,
+//     so forward consumers never touch the ring directly or take a TX lock.
+func NewXDPBatch(pump FrameSubmitter, srcMAC, dstMAC net.HardwareAddr) *XDPBatch {
 	return &XDPBatch{
-		sock:        sock,
-		srcMAC:      srcMAC,
-		dstMAC:      dstMAC,
-		genericMode: genericMode,
-		mu:          mu,
+		pump:   pump,
+		srcMAC: srcMAC,
+		dstMAC: dstMAC,
 	}
 }
 
@@ -128,42 +128,16 @@ func (b *XDPBatch) Flush(enableStats bool) error {
     n := b.count
     b.count = 0
 
-    // Lock 1: reap + alloc only
-    b.mu.Lock()
-    if nc := b.sock.NumCompleted(); nc > 0 {
-        b.sock.Complete(nc)
+    // Hand every built frame to the TX pump. The pump (single owner of the TX
+    // ring) does the reap/alloc/transmit; Submit is lock-free and never blocks,
+    // so concurrent forward consumers no longer serialize on a shared TX mutex.
+    for i := 0; i < n; i++ {
+        b.pump.Submit(b.bufs[i][:b.lens[i]])
     }
-    descs := b.sock.GetDescs(n, false)
-    b.mu.Unlock()
-	if len(descs) < n {
-    	fmt.Printf("XDPBatch.Flush: wanted %d descs, got %d\n", n, len(descs))
-	}
-    if len(descs) == 0 {
-        xdpFwdTxDrops.Add(int64(n))
-        return fmt.Errorf("TX UMEM exhausted, dropped %d packets", n)
-    }
-    send := len(descs)
-
-    // Frame filling outside the lock — each desc is exclusively ours
-    for i := 0; i < send; i++ {
-        umemFrame := b.sock.GetFrame(descs[i])
-        copied := copy(umemFrame, b.bufs[i][:b.lens[i]])
-        descs[i].Len = uint32(copied)
-    }
-
-    // Lock 2: submit + kick only
-    b.mu.Lock()
-    b.sock.Transmit(descs)
-    b.mu.Unlock()
 	if (enableStats) {
     	totalXDPFlushes.Add(1)
-    	totalXDPPackets.Add(int64(send))
+    	totalXDPPackets.Add(int64(n))
 	}
-
-    if dropped := n - send; dropped > 0 {
-        xdpFwdTxDrops.Add(int64(dropped))
-        return fmt.Errorf("XDP UMEM partial: sent %d, dropped %d packets", send, dropped)
-    }
     return nil
 }
 
@@ -180,8 +154,8 @@ func (b *XDPBatch) Empty() bool {
 
 // SendOne is a convenience wrapper for single-packet sends (backward-compat
 // replacement for the old SendOnSocket).
-func SendOne(sock *xdp.Socket, srcMAC, dstMAC net.HardwareAddr, genericMode bool, mu *sync.Mutex, pkt []byte, enableStats bool) error {
-	b := NewXDPBatch(sock, srcMAC, dstMAC, genericMode, mu)
+func SendOne(pump FrameSubmitter, srcMAC, dstMAC net.HardwareAddr, pkt []byte, enableStats bool) error {
+	b := NewXDPBatch(pump, srcMAC, dstMAC)
 	if err := b.Add(pkt, nil); err != nil {
 		return err
 	}

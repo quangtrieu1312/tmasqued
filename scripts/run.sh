@@ -31,4 +31,7 @@ genServerCert -f --dns-list ${SAN_DNS_LIST} --ip-list ${SAN_IP_LIST}
 genClientCA
 
 log "info" "Running masque daemon"
-tmasqued
+# exec so the daemon is PID 1 and receives SIGTERM directly (docker stop): its
+# handler runs RunPreDown + GracefullyShutDown, which detaches XDP and restores
+# the original WAN MTU. Without exec, bash (PID 1) would swallow the signal.
+exec tmasqued

@@ -4,9 +4,51 @@ package utility
 
 import (
 	"encoding/binary"
+	"expvar"
 	"sync/atomic"
 	"time"
 )
+
+// UploadPostReseq{Total,OOO} measure inner-TCP-seq order on the UPLOAD forward path
+// AFTER the resequencer, just before SNAT/egress. Compared against the input
+// (dg_rcvin_ooo) and the target's recv-OFO, this localizes residual reorder: if
+// post-reseq OOO ≈ 0 but the target still sees reorder, the egress (forward path /
+// virtio host TX) is the source; if post-reseq OOO ≈ input, the reseq is ineffective.
+// Highwater metric (conflates retransmit with reorder; the path is ~drop-free).
+var (
+	UploadPostReseqTotal = expvar.NewInt("upload_postreseq_total")
+	UploadPostReseqOOO   = expvar.NewInt("upload_postreseq_ooo")
+)
+
+// UploadOrderObserver tracks per-flow high-water TCP seq on the post-reseq upload
+// stream. One per forward-consumer goroutine, so no lock.
+type UploadOrderObserver struct {
+	maxSeq map[flowKey]uint32
+}
+
+func NewUploadOrderObserver() *UploadOrderObserver {
+	return &UploadOrderObserver{maxSeq: make(map[flowKey]uint32)}
+}
+
+func (o *UploadOrderObserver) Observe(ip []byte) {
+	seq, _, key, ok := parseTCP(ip)
+	if !ok {
+		return
+	}
+	UploadPostReseqTotal.Add(1)
+	mx, seen := o.maxSeq[key]
+	switch {
+	case !seen:
+		if len(o.maxSeq) >= 1<<16 {
+			o.maxSeq = make(map[flowKey]uint32)
+		}
+		o.maxSeq[key] = seq
+	case int32(seq-mx) < 0:
+		UploadPostReseqOOO.Add(1)
+	default:
+		o.maxSeq[key] = seq
+	}
+}
 
 // PreReseqTotal / PreReseqOOO measure download-path inner-TCP-seq order AS THE
 // SERVER FRAMES IT, at the tunChan consumer just before SendDatagram. The server
